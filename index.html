@@ -109,7 +109,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
  *  - teamrankings.com is NOT CORS-open; a browser page can never fetch it
  * ==================================================================== */
 
-const BUILD = "v5 · 2026-09-11";
+const BUILD = "v6 · 2026-09-18";
 
 const ESPN      = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_V2   = "https://site.api.espn.com/apis/v2/sports/football/nfl";
@@ -129,6 +129,39 @@ const PASS_OPP_EXP   = 0.25;
 const RUSH_OPP_EXP   = 0.10;
 const CARRY_RECENCY  = 0.50;
 const OPP_RATIO_CLAMP = [0.80, 1.20];
+
+/* ---- WEEK 1 2026 POST-MORTEM — see docs/week1-2026.md ----
+ * Graded 188 real player-games, the first live out-of-sample test.
+ *
+ * 1. Top-quartile projections ran +12.8 yards HIGH. Elite prior-season
+ *    baselines regress, and nothing in the model accounted for it. Shrinking
+ *    each baseline toward the positional mean is the fix, validated BOTH
+ *    ways before shipping: a within-2025 holdout (n = 371 QB / 1970 REC /
+ *    889 RB) and Week 1 itself agree on direction — quarterbacks and
+ *    receivers want shrinkage, running backs do not (best k = 1.00 in both).
+ *
+ * 2. The opponent term earns 15%, not 40%. That follows from the season
+ *    backtest, where opponent adjustment carried almost no signal.
+ *    CAUTION, and this corrects a first reading of the data: cutting it does
+ *    NOT fix the apparent "EDGE is inverted" effect. Top-vs-bottom quartile
+ *    spread on actual/baseline went -0.348 -> -0.243, but at ZERO opponent
+ *    weight it is still -0.242, and corr(softness, act/base) is only -0.048.
+ *    Most of that inversion is a ratio artifact: a 20-yard player can triple
+ *    his average, a 100-yard player cannot. Judge the ranking by absolute
+ *    production — corr(score, actual) = +0.242 — and by per-quartile bias,
+ *    never by act/base.
+ *
+ * 3. 17% of projected players never recorded a line; backup QBs were being
+ *    ranked as if they'd start. Depth charts now gate the board: 17.2% -> 9.0%.
+ */
+const SHRINK       = { QB: 0.90, REC: 0.85, RB: 1.00 }; // within-season, 2025-validated
+const SHRINK_CROSS = { QB: 0.80, REC: 0.82, RB: 0.97 }; // projecting across an offseason
+const POS_MEAN_FALLBACK = { QB: 208, REC: 34, RB: 37 }; // 2025 per-game means, recomputed at scan time
+const EDGE_W_PLAYER = 0.85;   // was 0.60
+const EDGE_W_OPP    = 0.15;   // was 0.40 — measured harmful in Week 1
+/* Depth ranks allowed on the board. Charts can lag, so this is a default-on
+   filter rather than a hard exclusion — the toggle turns it off. */
+const DEPTH_LIMIT = { QB: 1, RB: 3, WR: 4, TE: 2 };
 
 const T = {
   turf: "#14512f", turfDark: "#0e3b22", turfDeep: "#0a2d1a", turfLight: "#1a6139",
@@ -477,6 +510,31 @@ async function getBulkAthletes(season, sort, limit) {
   }).filter((p) => p.id && p.team && p.pos);
 }
 
+/**
+ * Offensive depth chart. The core feed returns three charts per team; the
+ * offensive one is whichever carries a `qb` position group (its name varies:
+ * "3WR 1TE", "2WR 2TE", …). Returns athleteId -> depth rank.
+ *
+ * Week 1 2026 is why this exists: Atlanta's board entry was Tua Tagovailoa,
+ * who is QB2 behind Michael Penix Jr. Backup QBs were being projected for
+ * 250 yards.
+ */
+async function getDepthChart(teamId, season) {
+  const d = await safeJSON(`${ESPN_CORE}/seasons/${season}/teams/${teamId}/depthcharts`);
+  const charts = d?.items || [];
+  const offense = charts.find((c) => c?.positions && (c.positions.qb || c.positions.rb));
+  if (!offense) return {};
+  const out = {};
+  Object.values(offense.positions).forEach((grp) => {
+    (grp?.athletes || []).forEach((a) => {
+      const id = String(a.athlete?.$ref || "").match(/athletes\/(\d+)/)?.[1];
+      if (!id) return;
+      if (out[id] === undefined || a.rank < out[id]) out[id] = a.rank;
+    });
+  });
+  return out;
+}
+
 /** Per-game log: recency, variance, and past meetings with this opponent. */
 async function getGameLog(playerId, season) {
   const d = await safeJSON(`${ESPN_WEB}/athletes/${playerId}/gamelog?season=${season}`);
@@ -563,6 +621,21 @@ const KIND_OF_POS = (pos) =>
   : ["RB", "FB"].includes(pos) ? "RB"
   : DEF_POS.includes(pos) ? "DEF" : null;
 
+/**
+ * Pull an extreme baseline toward the positional mean. An elite prior season
+ * is partly real and partly the high end of a noisy sample; shrinkage keeps
+ * the real part. Strength per position is measured, not assumed — running
+ * backs tested best at 1.00 (no shrinkage) in both the 2025 holdout and Week 1.
+ */
+function shrinkBaseline(base, kind, ctx) {
+  if (isNaN(base)) return base;
+  const pm = ctx?.posMean?.[kind] || POS_MEAN_FALLBACK[kind];
+  if (!pm) return base;
+  const table = ctx?.crossSeason ? SHRINK_CROSS : SHRINK;
+  const k = table[kind] !== undefined ? table[kind] : 1;
+  return pm + (base - pm) * k;
+}
+
 /** Distribution from the game log — the part the backtest said to trust. */
 function distribution(values) {
   const v = values.filter((x) => !isNaN(x));
@@ -624,7 +697,7 @@ function analyze(p, kind, ctx) {
       { label: "TD/G", value: fmt(td / G) }, { label: "RUSH/G", value: fmt(rush / G) },
     ];
     /* passing does NOT blend to recency — last-3 was 7% worse in the backtest */
-    const base = log ? mean(logVals("passingYards")) : yds / G;
+    const base = shrinkBaseline(log ? mean(logVals("passingYards")) : yds / G, "QB", ctx);
     dist = distribution(logVals("passingYards"));
     projected = { passYds: base * passMult, passTd: (td / G) * passMult, ints: ints / G, rushYds: rush / G };
     projLabels = [
@@ -651,7 +724,7 @@ function analyze(p, kind, ctx) {
       { label: "REC/G", value: fmt(rec / G), g: g4 }, { label: "YPR", value: fmt(ypr), g: g3 },
       { label: "TD", value: int(td) }, { label: "YDS", value: int(yds), sub: isNaN(G) ? "" : `${int(G)}g` },
     ];
-    const base = log ? mean(logVals("receivingYards")) : yds / G;
+    const base = shrinkBaseline(log ? mean(logVals("receivingYards")) : yds / G, "REC", ctx);
     dist = distribution(logVals("receivingYards"));
     projected = { recYds: base * passMult, rec: (rec / G) * passMult, tgt: tgt / G, td: (td / G) * passMult };
     projLabels = [
@@ -682,7 +755,7 @@ function analyze(p, kind, ctx) {
     const carSeason = carAll.length ? mean(carAll) : car / G;
     const carRecent = carAll.length >= 3 ? mean(lastN(carAll, 3)) : carSeason;
     const projCar = CARRY_RECENCY * carRecent + (1 - CARRY_RECENCY) * carSeason;
-    const base = log ? mean(logVals("rushingYards")) : yds / G;
+    const base = shrinkBaseline(log ? mean(logVals("rushingYards")) : yds / G, "RB", ctx);
     dist = distribution(logVals("rushingYards"));
     projected = {
       rushYds: base * rushMult, car: projCar, td: (td / G) * rushMult, recYds: recYds / G,
@@ -754,7 +827,7 @@ function analyze(p, kind, ctx) {
   const gs = grades.filter(Boolean).map((g) => GRADE_SCORE[g]);
   const playerScore = gs.length ? mean(gs) : null;
   const softness = defRank ? (defRank - 1) / Math.max(1, (ctx.teams || 32) - 1) : 0.5;
-  const score = playerScore === null ? null : Math.round((playerScore * 0.6 + softness * 0.4) * 100);
+  const score = playerScore === null ? null : Math.round((playerScore * EDGE_W_PLAYER + softness * EDGE_W_OPP) * 100);
 
   return {
     kind, phase, archetype, factors, projected, seasonCells, projLabels, grades,
@@ -814,10 +887,36 @@ async function runScan({ year, week, seasonType, league, tables, onProgress }) {
     })
     .filter((p) => opponent[p.team]);
 
+  onProgress?.("Reading depth charts…");
+  const charts = await pool(teamIds, 8, (t) => getDepthChart(t.id, year));
+  const depthOf = {};
+  teamIds.forEach((t, i) => {
+    Object.entries(charts[i] || {}).forEach(([id, rank]) => { depthOf[id] = rank; });
+  });
+
   onProgress?.("Reading game conditions…");
   const details = await pool(games, 8, (g) => getGameDetail(g.id));
   const detailByGame = {};
   games.forEach((g, i) => { detailByGame[g.id] = details[i]; });
+
+  /* Positional means for baseline shrinkage, computed from this slate rather
+     than hardcoded, so they track the league instead of drifting. */
+  const posSamples = { QB: [], REC: [], RB: [] };
+  players.forEach((p) => {
+    const k = KIND_OF_POS(p.pos);
+    if (!posSamples[k]) return;
+    const s = p.stats || {};
+    const gp = num(statOf(s, ["general", "passing", "rushing", "receiving"], ["gamesPlayed"]));
+    if (!(gp > 0)) return;
+    const v = k === "QB" ? num(s.passing?.passingYards)
+      : k === "REC" ? num(s.receiving?.receivingYards) : num(s.rushing?.rushingYards);
+    if (!isNaN(v)) posSamples[k].push(v / gp);
+  });
+  const posMean = {};
+  Object.entries(posSamples).forEach(([k, arr]) => {
+    posMean[k] = arr.length ? mean(arr) : POS_MEAN_FALLBACK[k];
+  });
+  const crossSeason = league.season !== year;
 
   onProgress?.(`Scoring ${players.length} players…`);
   const rows = [];
@@ -836,6 +935,7 @@ async function runScan({ year, week, seasonType, league, tables, onProgress }) {
       wx: detail?.weather,
       indoor: meta.game.indoor || detail?.indoor,
       implied: imp ? (meta.home ? imp.home : imp.away) : null,
+      posMean, crossSeason,
     };
     const a = analyze(p, kind, ctx);
     if (a.score === null) continue;
@@ -844,6 +944,7 @@ async function runScan({ year, week, seasonType, league, tables, onProgress }) {
     rows.push({
       player: p, kind, pos: p.pos, team: p.team, opp: meta.opp, home: meta.home,
       moved: p.moved, game: meta.game, ctx, analysis: a, score: a.score,
+      depth: depthOf[p.id] || null,
       state: meta.game.state || "pre", started: hasStarted(meta.game),
       leakage: league.season === year && hasStarted(meta.game),
     });
@@ -867,12 +968,243 @@ async function runScan({ year, week, seasonType, league, tables, onProgress }) {
     r.score = r.analysis.score;
   });
 
+  try { saveProjections(year, week, rows); } catch {}
+
   const started = games.filter(hasStarted);
   const played = started.filter((g) => g.state === "post" || g.completed).length;
   return {
     rows, games, byes, season: league.season, played, live: started.length - played,
     statYear: league.season, scanYear: year,
   };
+}
+
+/* ====================== RESULTS TRACKER ======================
+ * The tool grades itself. Every scan snapshots its projections; once a week
+ * is final those snapshots are scored against real box scores. Without this
+ * the model can only be argued about, never checked.
+ * ============================================================ */
+
+function saveProjections(year, week, rows) {
+  const snap = rows
+    .filter((r) => r.kind !== "DEF" && r.analysis?.headline?.logKey)
+    .map((r) => ({
+      id: r.player.id, name: r.player.name, pos: r.pos, kind: r.kind,
+      team: r.team, opp: r.opp, stat: r.analysis.headline.logKey,
+      proj: r.analysis.projected[r.analysis.headline.key],
+      p25: r.analysis.band?.p25adj, p75: r.analysis.band?.p75adj,
+      score: r.score, depth: r.depth || null,
+    }))
+    .filter((x) => isFinite(x.proj));
+  if (snap.length) store.set(`gx_proj_${year}_${week}`, { year, week, savedAt: Date.now(), rows: snap });
+}
+
+/** Per-player actuals for a finished week, from box scores. */
+async function weekActuals(games) {
+  const sums = await pool(games.map((g) => g.id), 8, (g) => safeJSON(`${ESPN}/summary?event=${g}`));
+  const out = {};
+  sums.forEach((s) => {
+    (s?.boxscore?.players || []).forEach((tb) => {
+      (tb.statistics || []).forEach((cat) => {
+        const keys = cat.keys || cat.labels || [];
+        (cat.athletes || []).forEach((a) => {
+          const id = a.athlete?.id; if (!id) return;
+          const rec = out[id] = out[id] || {};
+          const vals = {};
+          keys.forEach((k, i) => { vals[k] = a.stats?.[i]; });
+          if (cat.name === "passing") rec.passingYards = num(vals.passingYards);
+          if (cat.name === "rushing") rec.rushingYards = num(vals.rushingYards);
+          if (cat.name === "receiving") rec.receivingYards = num(vals.receivingYards);
+        });
+      });
+    });
+  });
+  return out;
+}
+
+async function gradeWeek(year, week, force) {
+  const gk = `gx_grade_${year}_${week}`;
+  if (!force) { const c = store.get(gk); if (c) return c; }
+  const snap = store.get(`gx_proj_${year}_${week}`);
+  if (!snap?.rows?.length) return null;
+  const { games } = await getSchedule(year, week, 2);
+  if (!games.length) return null;
+  const done = games.filter(hasStarted);
+  if (!done.length) return null;
+
+  const actual = await weekActuals(done);
+  const scored = snap.rows.map((r) => {
+    const a = actual[r.id];
+    const act = a ? a[r.stat] : undefined;
+    return { ...r, act: (act === undefined || isNaN(act)) ? null : act };
+  });
+  const played = scored.filter((r) => r.act !== null);
+  if (!played.length) return null;
+
+  const mae = (rows) => mean(rows.map((r) => Math.abs(r.proj - r.act)));
+  const byKind = {};
+  ["QB", "RB", "REC"].forEach((k) => {
+    const rows = played.filter((r) => r.kind === k);
+    if (rows.length) byKind[k] = { n: rows.length, mae: mae(rows), bias: mean(rows.map((r) => r.proj - r.act)) };
+  });
+  const banded = played.filter((r) => isFinite(r.p25) && isFinite(r.p75));
+  const coverage = banded.length
+    ? banded.filter((r) => r.act >= r.p25 && r.act <= r.p75).length / banded.length * 100 : NaN;
+
+  /* Does a high EDGE actually mean a better outcome? Compare the top and
+     bottom quartiles on how they did against their OWN projection. */
+  const ranked = [...played].filter((r) => r.proj > 0).sort((a, b) => b.score - a.score);
+  const q = Math.max(1, Math.floor(ranked.length / 4));
+  /* Median error, not a ratio. act/proj flatters small baselines — a 20-yard
+     player can triple his average and a 100-yard player cannot — which made
+     the ranking look inverted when it was mostly arithmetic. */
+  const medErr = (rows) => {
+    const d = rows.map((r) => r.proj - r.act).sort((a, b) => a - b);
+    return d.length ? d[Math.floor(d.length / 2)] : NaN;
+  };
+  const beat = (rows) => rows.filter((r) => r.act > r.proj).length / rows.length * 100;
+  const topQ = ranked.slice(0, q), botQ = ranked.slice(-q);
+
+  const result = {
+    year, week, gradedAt: Date.now(),
+    projected: snap.rows.length, played: played.length,
+    dnp: snap.rows.length - played.length,
+    overallMae: mae(played), byKind, coverage,
+    edge: {
+      topScore: mean(topQ.map((r) => r.score)), botScore: mean(botQ.map((r) => r.score)),
+      topBias: medErr(topQ), botBias: medErr(botQ),
+      topProd: mean(topQ.map((r) => r.act)), botProd: mean(botQ.map((r) => r.act)),
+      topBeat: beat(topQ), botBeat: beat(botQ), n: q,
+    },
+  };
+  store.set(gk, result);
+  return result;
+}
+
+function ReportCard({ year, currentWeek }) {
+  const [grades, setGrades] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const load = useCallback(async (force) => {
+    setBusy(true); setMsg("");
+    const out = [];
+    for (let w = 1; w < Math.max(currentWeek || 1, 1); w++) {
+      if (!store.get(`gx_proj_${year}_${w}`)) continue;
+      setMsg(`Grading week ${w}…`);
+      try { const g = await gradeWeek(year, w, force); if (g) out.push(g); } catch {}
+    }
+    setGrades(out); setBusy(false); setMsg("");
+  }, [year, currentWeek]);
+
+  useEffect(() => { load(false); }, [load]);
+
+  const cell = (v, d = 1, suffix = "") => (isFinite(v) ? v.toFixed(d) + suffix : "—");
+
+  return (
+    <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
+      <div style={{ flexShrink: 0, marginBottom: 14 }}>
+        <div style={{
+          fontFamily: "'Barlow Condensed',sans-serif", fontSize: 32, fontWeight: 700,
+          letterSpacing: 1.5, color: T.chalk, textShadow: `0 2px 0 ${T.leatherDark}`,
+        }}>REPORT <span style={{ color: T.gold }}>CARD</span></div>
+        <div style={{ fontSize: 11.5, color: T.inkDim, marginTop: 3 }}>
+          Every scan is snapshotted and scored once the week is final. This is the tool
+          checking its own work.
+        </div>
+      </div>
+
+      <div style={{ flex: 1, overflowY: "auto", paddingRight: 5 }}>
+        {busy && <Panel style={{ padding: 22 }}><span className="pulsing" style={{ color: T.gold, fontSize: 12 }}>{msg || "Grading…"}</span></Panel>}
+
+        {!busy && !grades.length && (
+          <Panel style={{ padding: "20px 18px", fontSize: 12, color: T.inkDim, lineHeight: 1.6 }}>
+            No graded weeks yet. Projections are saved automatically each time the Edge Board
+            scans a week — come back after those games finish and this fills in.
+            <div style={{ fontSize: 10, color: T.inkFaint, marginTop: 8 }}>
+              Snapshots live in this browser's local storage, so grading only covers weeks
+              scanned on this machine.
+            </div>
+          </Panel>
+        )}
+
+        {!busy && grades.map((g) => (
+          <Panel key={g.week} style={{ marginBottom: 12, overflow: "hidden" }}>
+            <div style={{
+              padding: "9px 13px", background: "rgba(0,0,0,.22)", display: "flex",
+              alignItems: "center", gap: 10, flexWrap: "wrap",
+            }}>
+              <span style={{
+                fontFamily: "'Barlow Condensed',sans-serif", fontSize: 18, fontWeight: 700,
+                letterSpacing: 1, color: T.chalk,
+              }}>WEEK {g.week}</span>
+              <Badge label={`${g.played} graded`} />
+              {g.dnp > 0 && <Badge label={`${g.dnp} never played`} tone={g.dnp / g.projected > .12 ? "cold" : "neutral"} />}
+              <span style={{ marginLeft: "auto", fontSize: 10, color: T.inkFaint }}>
+                band coverage {cell(g.coverage, 1, "%")} <span style={{ opacity: .7 }}>(ideal 50)</span>
+              </span>
+            </div>
+            <ChalkLine />
+            <div style={{ padding: "11px 13px" }}>
+              <div className="gx-statgrid" style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+                {Object.entries(g.byKind).map(([k, v]) => (
+                  <div key={k} style={{ minWidth: 92 }}>
+                    <div style={{ fontSize: 9, color: T.inkFaint, letterSpacing: .5 }}>
+                      {k === "REC" ? "WR/TE" : k} · n={v.n}
+                    </div>
+                    <div style={{
+                      fontFamily: "'Barlow Condensed',sans-serif", fontSize: 20,
+                      fontWeight: 700, color: T.chalk,
+                    }}>{cell(v.mae)} <span style={{ fontSize: 10, color: T.inkFaint }}>MAE</span></div>
+                    <div style={{ fontSize: 9, color: Math.abs(v.bias) < 5 ? T.good : T.bad }}>
+                      bias {v.bias > 0 ? "+" : ""}{cell(v.bias)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{
+                marginTop: 12, paddingTop: 10, borderTop: `1px solid ${T.chalkFaint}`,
+              }}>
+                <div style={{ fontSize: 9, color: T.inkFaint, letterSpacing: 1, marginBottom: 7 }}>
+                  DOES A HIGH EDGE MEAN A BETTER RESULT?
+                </div>
+                <div style={{ display: "flex", gap: 22, flexWrap: "wrap" }}>
+                  {[["Top quartile", g.edge.topScore, g.edge.topBias, g.edge.topProd, g.edge.topBeat],
+                    ["Bottom quartile", g.edge.botScore, g.edge.botBias, g.edge.botProd, g.edge.botBeat]].map(
+                    ([lbl, sc, bias, prod, bt]) => (
+                    <div key={lbl} style={{ minWidth: 150 }}>
+                      <div style={{ fontSize: 9, color: T.inkFaint }}>{lbl} · EDGE {cell(sc, 0)}</div>
+                      <div style={{
+                        fontFamily: "'Barlow Condensed',sans-serif", fontSize: 20, fontWeight: 700,
+                        color: Math.abs(bias) < 6 ? T.gold : T.bad,
+                      }}>{bias > 0 ? "+" : ""}{cell(bias)} <span style={{ fontSize: 10, color: T.inkFaint }}>median miss</span></div>
+                      <div style={{ fontSize: 9, color: T.inkFaint }}>
+                        produced {cell(prod, 0)} avg · {cell(bt, 0, "%")} beat their projection
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ fontSize: 9, color: T.inkFaint, marginTop: 8, lineHeight: 1.5 }}>
+                  Read the <strong>median miss</strong>: positive means the projection was too high for
+                  that group. A healthy board has both quartiles near zero — high-EDGE players should
+                  produce more in absolute terms (they do), without the projection overshooting them.
+                  Ratios like act/projection are not used here; they flatter small baselines and made
+                  the Week 1 ranking look inverted when the real problem was overshoot on elite players.
+                </div>
+              </div>
+            </div>
+          </Panel>
+        ))}
+
+        {!busy && (
+          <button onClick={() => load(true)} style={{
+            padding: "7px 14px", fontSize: 11, fontWeight: 600, borderRadius: 3, cursor: "pointer",
+            background: "rgba(0,0,0,.3)", color: T.ink, border: `1px solid ${T.chalkDim}`, marginTop: 4,
+          }}>↻ Re-grade all weeks</button>
+        )}
+      </div>
+    </div>
+  );
 }
 
 /* ------------------------------ UI atoms ------------------------------ */
@@ -1259,6 +1591,7 @@ function ScanRow({ rank, row, onOpen }) {
           {row.leakage && <Badge label="result is in the stat sample" tone="cold" icon="⚠" />}
           {a.archetype && <Badge label={a.archetype} tone="leather" />}
           {row.moved && <Badge label={`stats w/ ${row.moved}`} tone="cool" icon="⇄" />}
+          {row.depth > 1 && <Badge label={`${row.pos}${row.depth} on depth chart`} tone="cool" />}
           {defFactor && <Badge label={defFactor.label} />}
         </div>
       </div>
@@ -1283,12 +1616,20 @@ function ScanRow({ rank, row, onOpen }) {
 function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
   const [tab, setTab] = useState("QB");
   const [includePlayed, setIncludePlayed] = useState(false);
+  const [startersOnly, setStartersOnly] = useState(true);
   const allRows = scan?.rows || [];
   const active = SCAN_TABS.find((t) => t.key === tab);
-  const rows = useMemo(
-    () => (includePlayed ? allRows : allRows.filter((r) => !r.started)),
-    [allRows, includePlayed]
-  );
+  const rows = useMemo(() => {
+    let rs = includePlayed ? allRows : allRows.filter((r) => !r.started);
+    if (startersOnly) {
+      rs = rs.filter((r) => {
+        if (r.kind === "DEF" || r.depth == null) return true;  // unknown depth passes
+        const lim = DEPTH_LIMIT[r.pos];
+        return lim === undefined ? true : r.depth <= lim;
+      });
+    }
+    return rs;
+  }, [allRows, includePlayed, startersOnly]);
   const top = useMemo(() => rows.filter(active.match).slice(0, 10), [rows, tab]);
   const counts = useMemo(() => {
     const c = {};
@@ -1341,6 +1682,15 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
         ))}
         <label style={{
           marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 6,
+          fontSize: 11, color: T.inkDim, cursor: "pointer", userSelect: "none",
+        }}>
+          <input type="checkbox" checked={startersOnly}
+            onChange={(e) => setStartersOnly(e.target.checked)}
+            style={{ accentColor: T.gold, cursor: "pointer", width: "auto" }} />
+          Starters only
+        </label>
+        <label style={{
+          display: "inline-flex", alignItems: "center", gap: 6,
           fontSize: 11, color: T.inkDim, cursor: "pointer", userSelect: "none",
         }}>
           <input type="checkbox" checked={includePlayed}
@@ -1612,6 +1962,7 @@ function App() {
   const [week, setWeek] = useState(null);
   const [sched, setSched] = useState({ games: [], byes: [] });
   const [selected, setSelected] = useState(null);
+  const [view, setView] = useState("board");   // board | report
   const [league, setLeague] = useState(null);
   const [tables, setTables] = useState(null);
   const [dbProgress, setDbProgress] = useState("");
@@ -1678,7 +2029,7 @@ function App() {
         borderBottom: `2px solid ${T.chalk}`, flexShrink: 0, flexWrap: "wrap",
         boxShadow: `0 3px 0 ${T.leatherDark}, 0 8px 20px rgba(0,0,0,.4)`, zIndex: 2,
       }}>
-        <div onClick={() => setSelected(null)} style={{
+        <div onClick={() => { setSelected(null); setView("board"); }} style={{
           fontFamily: "'Barlow Condensed',sans-serif", fontSize: 25, fontWeight: 700,
           letterSpacing: 2.5, color: T.gold, cursor: "pointer",
           textShadow: `0 2px 0 ${T.leatherDark}, 0 4px 10px rgba(0,0,0,.55)`,
@@ -1709,14 +2060,22 @@ function App() {
           width: 224, borderRight: `2px solid ${T.chalkDim}`, overflowY: "auto",
           padding: "10px 0", flexShrink: 0, background: "rgba(0,0,0,.26)",
         }}>
-          <button className="game-btn" onClick={() => setSelected(null)} style={{
+          <button className="game-btn" onClick={() => { setSelected(null); setView("board"); }} style={{
             width: "100%", textAlign: "left", padding: "8px 12px", cursor: "pointer",
-            background: !selected ? "rgba(255,199,44,.15)" : "transparent",
-            border: `1px solid ${!selected ? T.gold : "transparent"}`,
-            borderLeft: `3px solid ${!selected ? T.gold : "transparent"}`,
+            background: !selected && view === "board" ? "rgba(255,199,44,.15)" : "transparent",
+            border: `1px solid ${!selected && view === "board" ? T.gold : "transparent"}`,
+            borderLeft: `3px solid ${!selected && view === "board" ? T.gold : "transparent"}`,
             borderRadius: 3, color: T.ink, marginBottom: 6,
             fontFamily: "'Barlow Condensed',sans-serif", fontSize: 15, fontWeight: 700, letterSpacing: 1.2,
           }}>📋 EDGE BOARD</button>
+          <button className="game-btn" onClick={() => { setSelected(null); setView("report"); }} style={{
+            width: "100%", textAlign: "left", padding: "8px 12px", cursor: "pointer",
+            background: view === "report" && !selected ? "rgba(255,199,44,.15)" : "transparent",
+            border: `1px solid ${view === "report" && !selected ? T.gold : "transparent"}`,
+            borderLeft: `3px solid ${view === "report" && !selected ? T.gold : "transparent"}`,
+            borderRadius: 3, color: T.ink, marginBottom: 6,
+            fontFamily: "'Barlow Condensed',sans-serif", fontSize: 15, fontWeight: 700, letterSpacing: 1.2,
+          }}>📊 REPORT CARD</button>
           <div style={{ padding: "0 12px 8px", fontSize: 9.5, color: T.inkFaint, letterSpacing: 1.4, fontWeight: 600 }}>
             {loading ? "LOADING…" : `${sched.games.length} GAMES`}
           </div>
@@ -1726,7 +2085,7 @@ function App() {
             const d = new Date(g.date);
             const done = hasStarted(g);
             return (
-              <button key={g.id} className="game-btn" onClick={() => setSelected(g)} style={{
+              <button key={g.id} className="game-btn" onClick={() => { setSelected(g); setView("board"); }} style={{
                 width: "100%", textAlign: "left",
                 background: sel ? "rgba(255,199,44,.15)" : "transparent",
                 border: `1px solid ${sel ? T.gold : "transparent"}`,
@@ -1771,9 +2130,13 @@ function App() {
               </div>
             </div>
           )}
-          {tables && !selected && (
+          {tables && !selected && view === "report" && (
+            <ReportCard year={year} currentWeek={week} />
+          )}
+          {tables && !selected && view === "board" && (
             <Scanner scan={scan} scanning={scanning} progress={progress} league={league}
-              week={week} onOpen={setSelected} onRescan={() => doScan(true)} />
+              week={week} onOpen={(g) => { setSelected(g); setView("board"); }}
+              onRescan={() => doScan(true)} />
           )}
           {tables && selected && (
             <GameView key={selected.id} game={selected} league={league} tables={tables}

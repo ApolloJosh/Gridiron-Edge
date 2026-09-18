@@ -47,6 +47,23 @@ Covered positions:
 Plus: league-wide defensive ranks (1–32) for every opponent, weather flags, injury report,
 divisional-game flag, bye teams, and a week selector for any week of any recent season.
 
+## How it's actually doing
+
+The tool grades itself. Every scan snapshots its projections; once the week is final the
+**Report Card** view scores them. First live week ([full write-up](docs/week1-2026.md)):
+
+| Week 1 2026 (n=188) | Result |
+|---|---|
+| Band coverage | **46.8%** vs ideal 50 — the range works out of sample |
+| Overall bias | +0.6 yards — unbiased in aggregate |
+| RB / WR-TE MAE | 25.4 / 25.7 |
+| QB MAE | 71.0, correlation **−0.18** — no information |
+| Projected players who never played | **17.2%** → fixed to 9.0% in v6 |
+
+What it got wrong and what changed: elite baselines overshot by +12.8 yards (now shrunk toward
+the positional mean), backup QBs were ranked as starters (depth charts now gate the board), and
+the opponent term still isn't paying for itself (weight cut 40% → 15%).
+
 ## What the data actually supports
 
 Every constant in the model was chosen by backtest, not by intuition — 3,084 player-games,
