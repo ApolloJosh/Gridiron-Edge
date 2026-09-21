@@ -109,7 +109,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
  *  - teamrankings.com is NOT CORS-open; a browser page can never fetch it
  * ==================================================================== */
 
-const BUILD = "v6 · 2026-09-18";
+const BUILD = "v8 · 2026-09-21";
 
 const ESPN      = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_V2   = "https://site.api.espn.com/apis/v2/sports/football/nfl";
@@ -466,23 +466,41 @@ async function getRoster(teamId) {
   })).filter((a) => a.id && a.pos);
 }
 
-async function getAthleteSeason(playerId) {
+/**
+ * Season stats for one athlete, PINNED to a season.
+ *
+ * This used to take "the latest season with any data", which quietly broke
+ * the matchup view once the new year started: a quarterback who had played
+ * week 1 resolved to a 29-attempt 2026 sample while his backup resolved to a
+ * full 66-attempt 2025 season — different players measured over different
+ * spans, compared against each other and fed to the same model. Pin the
+ * season, and fall back only to the most recent EARLIER season.
+ */
+async function getAthleteSeason(playerId, season) {
   const d = await safeJSON(`${ESPN_WEB}/athletes/${playerId}/stats`);
   if (!d?.categories) return null;
+  const pick = (seasons) => {
+    let exact = null, earlier = null;
+    for (const s of seasons) {
+      const y = s?.season?.year;
+      if (y == null) continue;
+      if (season != null && y === season) exact = s;
+      else if (season == null || y < season) {
+        if (!earlier || y > earlier.season.year) earlier = s;
+      }
+    }
+    return exact || earlier;
+  };
   const out = { season: null };
   for (const cat of d.categories) {
     const names = cat.names || [], seasons = cat.statistics || [];
     if (!names.length || !seasons.length) continue;
-    let latest = null;
-    for (const s of seasons) {
-      const y = s?.season?.year;
-      if (y != null && (!latest || y > latest.season.year)) latest = s;
-    }
-    if (!latest) continue;
+    const chosen = pick(seasons);
+    if (!chosen) continue;
     const vals = {};
-    names.forEach((n, i) => { vals[n] = latest.stats?.[i]; });
+    names.forEach((n, i) => { vals[n] = chosen.stats?.[i]; });
     out[cat.name] = vals;
-    if (!out.season || latest.season.year > out.season) out.season = latest.season.year;
+    if (!out.season || chosen.season.year > out.season) out.season = chosen.season.year;
   }
   return out.season ? out : null;
 }
@@ -523,16 +541,85 @@ async function getDepthChart(teamId, season) {
   const d = await safeJSON(`${ESPN_CORE}/seasons/${season}/teams/${teamId}/depthcharts`);
   const charts = d?.items || [];
   const offense = charts.find((c) => c?.positions && (c.positions.qb || c.positions.rb));
-  if (!offense) return {};
-  const out = {};
+  if (!offense) return { ranks: {}, qb: [] };
+  const ranks = {};
+  const idsOf = (grp) => (grp?.athletes || []).map((a) => ({
+    rank: a.rank, id: String(a.athlete?.$ref || "").match(/athletes\/(\d+)/)?.[1],
+  })).filter((x) => x.id).sort((a, b) => a.rank - b.rank);
   Object.values(offense.positions).forEach((grp) => {
-    (grp?.athletes || []).forEach((a) => {
-      const id = String(a.athlete?.$ref || "").match(/athletes\/(\d+)/)?.[1];
-      if (!id) return;
-      if (out[id] === undefined || a.rank < out[id]) out[id] = a.rank;
+    idsOf(grp).forEach(({ id, rank }) => {
+      if (ranks[id] === undefined || rank < ranks[id]) ranks[id] = rank;
     });
   });
+  return { ranks, qb: idsOf(offense.positions.qb) };
+}
+
+/* ====================== STARTING QUARTERBACK ======================
+ * QB is not like the other positions. A backup running back gets carries;
+ * a backup quarterback gets nothing unless the starter goes down, so ranking
+ * QB2 at all is simply wrong — a projection of 100 yards for a man who will
+ * not take a snap.
+ *
+ * Resolution, in order:
+ *   1. the depth chart's QB order (ESPN's current statement of who starts)
+ *   2. drop anyone Out / Doubtful / IR / suspended on THIS GAME's report
+ *   3. highest surviving rank is the starter
+ *   4. no usable chart -> whoever leads the team in attempts this season
+ *
+ * Validated across all 32 teams in Week 2 2026: every team resolved to
+ * exactly one QB; Seattle correctly promoted Drew Lock with Sam Darnold Out.
+ * Where the chart and actual usage disagree with no injury to explain it
+ * (Atlanta, Minnesota), the pick is FLAGGED rather than silently made —
+ * those are real quarterback controversies and the user should look.
+ *
+ * Note the per-athlete injuries endpoint is useless here: it returns zero
+ * items for every quarterback checked. The game summary's injury block is
+ * the only feed that actually carries "Out".
+ */
+const QB_OUT_RE = /^(out|doubtful|injured reserve|ir\b|suspend|physically unable|did not)/i;
+
+/** team -> { id, att } for whoever is throwing the ball this season. */
+async function getQbUsage(season) {
+  const url = `${BYATHLETE}?region=us&lang=en&contentorigin=espn&isqualified=false`
+    + `&season=${season}&seasontype=2&page=1&limit=80&sort=${encodeURIComponent("passing.passingAttempts:desc")}`;
+  const d = await safeJSON(url);
+  if (!d?.athletes) return {};
+  const schema = {};
+  (d.categories || []).forEach((c) => { schema[c.name] = c.names || []; });
+  const out = {};
+  d.athletes.forEach((a) => {
+    if (a.athlete?.position?.abbreviation !== "QB") return;
+    const team = a.athlete?.teamShortName;
+    if (!team) return;
+    const cat = (a.categories || []).find((c) => c.name === "passing");
+    const names = schema.passing || [];
+    const att = num((cat?.values || [])[names.indexOf("passingAttempts")]);
+    if (!(att > 0)) return;
+    if (!out[team] || att > out[team].att) {
+      out[team] = { id: String(a.athlete.id), att, name: a.athlete.displayName };
+    }
+  });
   return out;
+}
+
+function resolveStarterQB(teamAbbr, chartQbs, injuriesForTeam, usage) {
+  const inj = injuriesForTeam || {};
+  const statusOf = (id) => inj[String(id)] || "";
+  const chart = chartQbs || [];
+  const healthy = chart.filter((c) => !QB_OUT_RE.test(statusOf(c.id)));
+  const use = usage?.[teamAbbr] || null;
+
+  let pick = healthy[0] || null, via = "depth chart", promotedFrom = null;
+  if (chart[0] && QB_OUT_RE.test(statusOf(chart[0].id)) && pick) {
+    via = "depth chart + injury report";
+    promotedFrom = { id: chart[0].id, status: statusOf(chart[0].id) };
+  }
+  if (!pick && use) { pick = { id: use.id, rank: 1 }; via = "season usage"; }
+  if (!pick) return null;
+
+  const conflict = use && !promotedFrom && String(use.id) !== String(pick.id)
+    ? { id: use.id, name: use.name, att: use.att } : null;
+  return { id: String(pick.id), via, promotedFrom, conflict };
 }
 
 /** Per-game log: recency, variance, and past meetings with this opponent. */
@@ -560,18 +647,22 @@ async function getGameDetail(eventId) {
   const d = await safeJSON(`${ESPN}/summary?event=${eventId}`);
   if (!d) return null;
   const w = d.gameInfo?.weather || null;
-  const injuries = {};
+  const injuries = {}, injuriesById = {};
   (Array.isArray(d.injuries) ? d.injuries : []).forEach((block) => {
     const ab = block.team?.abbreviation;
     if (!ab) return;
     injuries[ab] = (block.injuries || []).map((x) => ({
       name: x.athlete?.displayName, pos: x.athlete?.position?.abbreviation, status: x.status,
     }));
+    injuriesById[ab] = {};
+    (block.injuries || []).forEach((x) => {
+      if (x.athlete?.id) injuriesById[ab][String(x.athlete.id)] = x.status;
+    });
   });
   return {
     weather: w ? { temp: w.temperature ?? w.highTemperature, gust: w.gust } : null,
     indoor: d.gameInfo?.venue?.indoor,
-    injuries,
+    injuries, injuriesById,
   };
 }
 
@@ -890,14 +981,32 @@ async function runScan({ year, week, seasonType, league, tables, onProgress }) {
   onProgress?.("Reading depth charts…");
   const charts = await pool(teamIds, 8, (t) => getDepthChart(t.id, year));
   const depthOf = {};
+  const chartQbOf = {};
   teamIds.forEach((t, i) => {
-    Object.entries(charts[i] || {}).forEach(([id, rank]) => { depthOf[id] = rank; });
+    const c = charts[i] || { ranks: {}, qb: [] };
+    Object.entries(c.ranks || {}).forEach(([id, rank]) => { depthOf[id] = rank; });
+    chartQbOf[t.abbr] = c.qb || [];
   });
 
   onProgress?.("Reading game conditions…");
   const details = await pool(games, 8, (g) => getGameDetail(g.id));
   const detailByGame = {};
   games.forEach((g, i) => { detailByGame[g.id] = details[i]; });
+
+  /* Exactly one quarterback per team gets projected. */
+  onProgress?.("Confirming starting quarterbacks…");
+  const qbUsage = await getQbUsage(year);
+  const injByTeam = {};
+  details.forEach((d) => {
+    Object.entries(d?.injuriesById || {}).forEach(([team, map]) => {
+      injByTeam[team] = Object.assign(injByTeam[team] || {}, map);
+    });
+  });
+  const starterQB = {};
+  teamIds.forEach((t) => {
+    const r = resolveStarterQB(t.abbr, chartQbOf[t.abbr], injByTeam[t.abbr], qbUsage);
+    if (r) starterQB[t.abbr] = r;
+  });
 
   /* Positional means for baseline shrinkage, computed from this slate rather
      than hardcoded, so they track the league instead of drifting. */
@@ -923,6 +1032,12 @@ async function runScan({ year, week, seasonType, league, tables, onProgress }) {
   for (const p of players) {
     const kind = KIND_OF_POS(p.pos);
     if (!kind) continue;
+    /* A backup QB is not a low-value play, it is a non-event. Drop outright
+       rather than ranking him — see resolveStarterQB. */
+    if (kind === "QB") {
+      const st = starterQB[p.team];
+      if (st && String(p.id) !== st.id) continue;
+    }
     const meta = opponent[p.team];
     const detail = detailByGame[meta.game.id];
     const imp = impliedTotals(meta.game);
@@ -945,6 +1060,7 @@ async function runScan({ year, week, seasonType, league, tables, onProgress }) {
       player: p, kind, pos: p.pos, team: p.team, opp: meta.opp, home: meta.home,
       moved: p.moved, game: meta.game, ctx, analysis: a, score: a.score,
       depth: depthOf[p.id] || null,
+      starter: kind === "QB" ? starterQB[p.team] || null : null,
       state: meta.game.state || "pre", started: hasStarted(meta.game),
       leakage: league.season === year && hasStarted(meta.game),
     });
@@ -974,6 +1090,7 @@ async function runScan({ year, week, seasonType, league, tables, onProgress }) {
   const played = started.filter((g) => g.state === "post" || g.completed).length;
   return {
     rows, games, byes, season: league.season, played, live: started.length - played,
+    starterQB, posMean,
     statYear: league.season, scanYear: year,
   };
 }
@@ -1592,6 +1709,10 @@ function ScanRow({ rank, row, onOpen }) {
           {a.archetype && <Badge label={a.archetype} tone="leather" />}
           {row.moved && <Badge label={`stats w/ ${row.moved}`} tone="cool" icon="⇄" />}
           {row.depth > 1 && <Badge label={`${row.pos}${row.depth} on depth chart`} tone="cool" />}
+          {row.starter?.promotedFrom && <Badge tone="cold" icon="⚠"
+            label={`starting — listed QB1 ${row.starter.promotedFrom.status}`} />}
+          {row.starter?.conflict && <Badge tone="cool" icon="?"
+            label={`QB unclear — ${row.starter.conflict.name} has ${row.starter.conflict.att} att`} />}
           {defFactor && <Badge label={defFactor.label} />}
         </div>
       </div>
@@ -1617,6 +1738,7 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
   const [tab, setTab] = useState("QB");
   const [includePlayed, setIncludePlayed] = useState(false);
   const [startersOnly, setStartersOnly] = useState(true);
+  const [sortBy, setSortBy] = useState("proj");   // proj | edge
   const allRows = scan?.rows || [];
   const active = SCAN_TABS.find((t) => t.key === tab);
   const rows = useMemo(() => {
@@ -1630,7 +1752,16 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
     }
     return rs;
   }, [allRows, includePlayed, startersOnly]);
-  const top = useMemo(() => rows.filter(active.match).slice(0, 10), [rows, tab]);
+  const projOf = (r) => {
+    const h = r.analysis?.headline;
+    const v = h ? r.analysis.projected[h.key] : NaN;
+    return isFinite(v) ? v : -1;
+  };
+  const top = useMemo(() => {
+    const list = rows.filter(active.match);
+    list.sort(sortBy === "proj" ? (a, b) => projOf(b) - projOf(a) : (a, b) => b.score - a.score);
+    return list.slice(0, 10);
+  }, [rows, tab, sortBy]);
   const counts = useMemo(() => {
     const c = {};
     SCAN_TABS.forEach((t) => { c[t.key] = rows.filter(t.match).length; });
@@ -1680,8 +1811,19 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
             boxShadow: tab === t.key ? SHADOW_SM : "none",
           }}>{t.label}<span style={{ opacity: .65, fontSize: 10, marginLeft: 6 }}>{counts[t.key] || 0}</span></button>
         ))}
+        <div style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 4 }}>
+          <span style={{ fontSize: 9, color: T.inkFaint, letterSpacing: .8, marginRight: 2 }}>SORT</span>
+          {[["proj", "Proj yds"], ["edge", "EDGE"]].map(([k, lbl]) => (
+            <button key={k} onClick={() => setSortBy(k)} style={{
+              padding: "5px 10px", fontSize: 11, fontWeight: 600, borderRadius: 3, cursor: "pointer",
+              background: sortBy === k ? "rgba(255,199,44,.18)" : "rgba(0,0,0,.3)",
+              color: sortBy === k ? T.gold : T.inkDim,
+              border: `1px solid ${sortBy === k ? T.gold : T.chalkDim}`, minHeight: 32,
+            }}>{lbl}</button>
+          ))}
+        </div>
         <label style={{
-          marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 6,
+          display: "inline-flex", alignItems: "center", gap: 6,
           fontSize: 11, color: T.inkDim, cursor: "pointer", userSelect: "none",
         }}>
           <input type="checkbox" checked={startersOnly}
@@ -1730,7 +1872,7 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
               display: "flex", alignItems: "center", gap: 8, padding: "8px 12px",
               background: "rgba(0,0,0,.25)", fontSize: 9, letterSpacing: 1.3,
               color: T.inkFaint, fontWeight: 600,
-            }}>TOP 10 {active.label} · RANGE IS THE MIDDLE 50% OF HIS GAMES · CLICK FOR THE FULL MATCHUP</div>
+            }}>TOP 10 {active.label} BY {sortBy === "proj" ? "PROJECTED YARDS" : "EDGE"} · RANGE IS THE MIDDLE 50% OF HIS GAMES · CLICK FOR THE FULL MATCHUP</div>
             <ChalkLine />
             {top.map((row, i) => <ScanRow key={row.player.id} rank={i + 1} row={row} onOpen={onOpen} />)}
           </Panel>
@@ -1754,11 +1896,15 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
 
 /* ------------------------------ game view ------------------------------ */
 
-function GameView({ game, league, tables, onBack }) {
+function GameView({ game, league, tables, year, posMean, onBack }) {
+  const secRefs = {
+    QB: useRef(null), REC: useRef(null), RB: useRef(null), DEF: useRef(null),
+  };
   const [side, setSide] = useState("home");
   const [detail, setDetail] = useState(null);
   const [groups, setGroups] = useState({ QB: [], REC: [], RB: [], DEF: [] });
   const [logs, setLogs] = useState({});
+  const [starter, setStarter] = useState(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState(null);
   const reqId = useRef(0);
@@ -1781,7 +1927,7 @@ function GameView({ game, league, tables, onBack }) {
         const offWant = offRoster.filter((p) => OFF_POS.includes(p.pos));
         const defWant = defRoster.filter((p) => DEF_POS.includes(p.pos));
         const all = [...offWant, ...defWant];
-        const stats = await pool(all, 8, (p) => getAthleteSeason(p.id));
+        const stats = await pool(all, 8, (p) => getAthleteSeason(p.id, league.season));
         if (my !== reqId.current) return;
 
         const offInj = detail?.injuries?.[off.abbr] || [];
@@ -1792,9 +1938,36 @@ function GameView({ game, league, tables, onBack }) {
         const v = (p, cat, key) => num(p.stats?.[cat]?.[key]) || 0;
         const dv = (p) => num(defStat(p.stats, ["totalTackles"])) || 0;
 
+        /* One quarterback, resolved the same way the board does it. Taking
+           the top two by attempts is how a backup ended up projected for 100
+           yards in a game he would never enter. */
+        /* Depth chart and usage must come from the CURRENT season, not the
+           stats season — a 2025 chart would name last year's starter. */
+        const [chart, usage] = await Promise.all([
+          getDepthChart(off.id, year), getQbUsage(year),
+        ]);
+        const st = resolveStarterQB(off.abbr, chart.qb, detail?.injuriesById?.[off.abbr], usage);
+        if (my !== reqId.current) return;
+        setStarter(st);
+        const qbPool = offWant.filter((p) => p.pos === "QB");
+        let qbShow = [];
+        if (st) {
+          /* Never substitute a different quarterback. If the resolved starter
+             has no prior-season line (a rookie, or a first-time starter), show
+             HIM with whatever exists — falling back to "whoever threw most last
+             season" is precisely how Jameis Winston displaced Jaxson Dart. */
+          const idx = qbPool.findIndex((p) => String(p.id) === st.id);
+          if (idx >= 0) {
+            const base = offPlayers.find((p) => String(p.id) === st.id);
+            qbShow = [base || { ...qbPool[idx], stats: null, noPriorData: true }];
+          }
+        }
+        if (!qbShow.length) {
+          qbShow = offPlayers.filter((p) => p.pos === "QB")
+            .sort((a, b) => v(b, "passing", "passingAttempts") - v(a, "passing", "passingAttempts")).slice(0, 1);
+        }
         const g = {
-          QB: offPlayers.filter((p) => p.pos === "QB")
-            .sort((a, b) => v(b, "passing", "passingAttempts") - v(a, "passing", "passingAttempts")).slice(0, 2),
+          QB: qbShow,
           REC: offPlayers.filter((p) => ["WR", "TE"].includes(p.pos))
             .sort((a, b) => v(b, "receiving", "receivingYards") - v(a, "receiving", "receivingYards")).slice(0, 5),
           RB: offPlayers.filter((p) => ["RB", "FB"].includes(p.pos))
@@ -1815,7 +1988,7 @@ function GameView({ game, league, tables, onBack }) {
         setErr(e.message); setLoading(false);
       }
     })();
-  }, [game.id, side, off.id, def.id, detail, league.season]);
+  }, [game.id, side, off.id, def.id, detail, league.season, year]);
 
   const when = useMemo(() => {
     const d = new Date(game.date);
@@ -1830,11 +2003,29 @@ function GameView({ game, league, tables, onBack }) {
   const offInjuries = detail?.injuries?.[off.abbr] || [];
   const impliedFor = imp ? (side === "home" ? imp.home : imp.away) : null;
 
-  const ctxFor = (id) => ({
-    defAbbr: def.abbr, defRow, offRow, league: tables?.league, teams: tables?.teams || 32,
-    wx, indoor, implied: impliedFor, log: logs[id] || null,
-    oppHistory: (logs[id] || []).filter((g) => g.opp === def.abbr),
-  });
+  /* One ctx object per player, memoised so PlayerCard's own useMemo holds and
+     so each group can be ordered by its projected headline number. */
+  const ordered = useMemo(() => {
+    const build = (list, kind) => (list || []).map((p) => {
+      const log = logs[p.id] || null;
+      const ctx = {
+        defAbbr: def.abbr, defRow, offRow, league: tables?.league, teams: tables?.teams || 32,
+        wx, indoor, implied: impliedFor, log,
+        oppHistory: log ? log.filter((g) => g.opp === def.abbr) : null,
+        posMean, crossSeason: league.season !== year,
+      };
+      const a = analyze(p, kind, ctx);
+      const head = a.headline;
+      const proj = head && isFinite(a.projected[head.key]) ? a.projected[head.key] : -1;
+      return { p, ctx, kind, proj };
+    }).sort((x, y) => y.proj - x.proj);
+    return {
+      QB: build(groups.QB, "QB"), REC: build(groups.REC, "REC"),
+      RB: build(groups.RB, "RB"), DEF: build(groups.DEF, "DEF"),
+    };
+  }, [groups, logs, def.abbr, defRow, offRow, tables, wx, indoor, impliedFor, posMean, league.season, year]);
+
+  const jump = (k) => secRefs[k]?.current?.scrollIntoView({ behavior: "smooth", block: "start" });
 
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
@@ -1876,6 +2067,24 @@ function GameView({ game, league, tables, onBack }) {
         ))}
       </div>
 
+      {/* jump nav — beats scrolling past four sections to reach the backs */}
+      <div className="gx-tabs" style={{
+        display: "flex", gap: 6, marginBottom: 12, flexShrink: 0, flexWrap: "wrap",
+        alignItems: "center",
+      }}>
+        <span style={{ fontSize: 9, color: T.inkFaint, letterSpacing: 1, marginRight: 2 }}>JUMP TO</span>
+        {[["QB", "🎯 QB", ordered.QB.length], ["REC", "⚡ WR/TE", ordered.REC.length],
+          ["RB", "🏃 RB", ordered.RB.length], ["DEF", `🛡 ${def.abbr} D`, ordered.DEF.length]].map(
+          ([k, label, n]) => (
+          <button key={k} onClick={() => jump(k)} disabled={!n} style={{
+            padding: "6px 12px", fontSize: 12, fontWeight: 700, borderRadius: 3,
+            cursor: n ? "pointer" : "default", background: "rgba(0,0,0,.3)",
+            color: n ? T.ink : T.inkFaint, border: `1px solid ${T.chalkDim}`,
+            fontFamily: "'Barlow Condensed',sans-serif", letterSpacing: .8, minHeight: 34,
+          }}>{label}<span style={{ opacity: .6, fontSize: 10, marginLeft: 5 }}>{n}</span></button>
+        ))}
+      </div>
+
       <div style={{ flex: 1, overflowY: "auto", paddingRight: 5 }}>
         <DefenseCard def={defRow} off={offRow} league={tables?.league} defAbbr={def.abbr}
           season={tables?.season} implied={impliedFor} />
@@ -1904,14 +2113,31 @@ function GameView({ game, league, tables, onBack }) {
 
         {!loading && (
           <>
+            <div ref={secRefs.QB} style={{ scrollMarginTop: 8 }} />
             <SectionTitle right={`${def.abbr} allows ${fmt(defRow?.passYdsPg)} pass yds/g`}>🎯 Quarterback</SectionTitle>
-            {groups.QB.map((p) => <PlayerCard key={p.id} p={p} kind="QB" ctx={ctxFor(p.id)} />)}
-            <SectionTitle right={`${ordinal(defRow?.rankPassYds)} vs the pass`}>⚡ Receivers &amp; Tight Ends</SectionTitle>
-            {groups.REC.map((p) => <PlayerCard key={p.id} p={p} kind="REC" ctx={ctxFor(p.id)} />)}
-            <SectionTitle right={`${def.abbr} allows ${fmt(defRow?.ypcAllowed, 2)} per carry`}>🏃 Running Backs</SectionTitle>
-            {groups.RB.map((p) => <PlayerCard key={p.id} p={p} kind="RB" ctx={ctxFor(p.id)} />)}
-            <SectionTitle right={`${off.abbr} runs ${fmt(tables?.offense?.[off.abbr]?.playsPg)} plays/g`}>🛡 {def.abbr} Defenders</SectionTitle>
-            {groups.DEF.map((p) => <PlayerCard key={p.id} p={p} kind="DEF" ctx={ctxFor(p.id)} />)}
+            {starter && (
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+                <Badge label={`Starter via ${starter.via}`} tone="warm" icon="✓" />
+                {starter.promotedFrom && (
+                  <Badge tone="cold" icon="⚠"
+                    label={`promoted — listed starter ${starter.promotedFrom.status}`} />
+                )}
+                {starter.conflict && (
+                  <Badge tone="cool" icon="?"
+                    label={`QB situation unclear — ${starter.conflict.name} leads the team with ${starter.conflict.att} attempts`} />
+                )}
+              </div>
+            )}
+            {ordered.QB.map(({ p, ctx }) => <PlayerCard key={p.id} p={p} kind="QB" ctx={ctx} />)}
+            <div ref={secRefs.REC} style={{ scrollMarginTop: 8 }} />
+            <SectionTitle right={`${ordinal(defRow?.rankPassYds)} vs the pass · sorted by projected yards`}>⚡ Receivers &amp; Tight Ends</SectionTitle>
+            {ordered.REC.map(({ p, ctx }) => <PlayerCard key={p.id} p={p} kind="REC" ctx={ctx} />)}
+            <div ref={secRefs.RB} style={{ scrollMarginTop: 8 }} />
+            <SectionTitle right={`${def.abbr} allows ${fmt(defRow?.ypcAllowed, 2)} per carry · sorted by projected yards`}>🏃 Running Backs</SectionTitle>
+            {ordered.RB.map(({ p, ctx }) => <PlayerCard key={p.id} p={p} kind="RB" ctx={ctx} />)}
+            <div ref={secRefs.DEF} style={{ scrollMarginTop: 8 }} />
+            <SectionTitle right={`${off.abbr} runs ${fmt(tables?.offense?.[off.abbr]?.playsPg)} plays/g · sorted by projected tackles`}>🛡 {def.abbr} Defenders</SectionTitle>
+            {ordered.DEF.map(({ p, ctx }) => <PlayerCard key={p.id} p={p} kind="DEF" ctx={ctx} />)}
             <div style={{ fontSize: 10, color: T.inkFaint, lineHeight: 1.6, padding: "4px 0 22px" }}>
               Opponent factors are applied at measured strength: passing ^{PASS_OPP_EXP}, rushing ^{RUSH_OPP_EXP}.
               Rushing is near-zero because that's what the backtest found — full-strength opponent
@@ -2140,7 +2366,7 @@ function App() {
           )}
           {tables && selected && (
             <GameView key={selected.id} game={selected} league={league} tables={tables}
-              onBack={() => setSelected(null)} />
+              year={year} posMean={scan?.posMean} onBack={() => setSelected(null)} />
           )}
         </div>
       </div>
