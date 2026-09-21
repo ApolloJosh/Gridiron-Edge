@@ -226,6 +226,65 @@ than scraped. Paid scraping would only earn its keep for data ESPN genuinely lac
 closing betting lines (§13), or snap counts / route participation / aDOT, which would unlock
 the defense-vs-archetype factor.
 
+## 15. Confirming the starting quarterback
+
+Backups matter at every position except this one. A backup running back gets carries; a backup
+quarterback gets nothing at all unless the starter goes down. Ranking QB2 isn't a low-value
+play, it's a projection for a man who will not take a snap — Tommy DeVito was being projected
+for ~100 yards behind a healthy Drake Maye.
+
+**The signals, in order of authority:**
+
+1. **Depth chart** — `sports.core.api.espn.com/v2/…/seasons/{year}/teams/{id}/depthcharts`.
+   Three charts per team; the offensive one is whichever carries a `qb` group (name varies:
+   "3WR 1TE", "2WR 2TE"). `positions.qb.athletes[]` gives `rank` and an athlete `$ref`.
+   Use the **current** season here — a 2025 chart names last year's starter.
+2. **This game's injury report** — `summary?event={id}` → `injuries[].injuries[]`. Drop any QB
+   listed Out / Doubtful / IR / suspended, then take the highest surviving rank.
+3. **Season usage** — bulk `byathlete` sorted by `passing.passingAttempts:desc`, one request,
+   gives the attempts leader per team. Fallback when there's no chart, and a cross-check.
+
+**The per-athlete injuries endpoint is useless.** `…/athletes/{id}/injuries` returned **zero
+items for every quarterback tested**, including Sam Darnold while he was listed Out. The game
+summary's injury block is the only feed that carries it.
+
+**Measured across all 32 teams, Week 2 2026:**
+
+- All 32 resolved to exactly one quarterback.
+- Depth chart and usage agreed on **29 of 32**.
+- Seattle: chart said Darnold, report said **Darnold Out**, so Drew Lock was promoted — and
+  usage confirms it (22 attempts). The rule got this right without special-casing.
+- Atlanta and Minnesota disagreed with no injury to explain it (chart: Penix / Murray; usage:
+  Rush 22 att / Wentz 19 att). Those are genuine quarterback controversies, so the pick is
+  **flagged in the UI rather than silently made**.
+
+Where this is enforced matters. The Edge Board had a depth filter from v6, but the matchup view
+did not — it took the top two quarterbacks by attempts, which is exactly how a backup got a
+projection. Both paths now run through `resolveStarterQB()`.
+
+## 16. Pin the athlete-stats season, or players get measured over different spans
+
+`athletes/{id}/stats` returns a category per stat type, each holding one entry **per season of
+a career**. Taking "the latest season with data" works in the offseason and breaks the moment
+the new year starts:
+
+- Jaxson Dart, who had played Week 1 2026, resolved to a **29-attempt 2026** sample.
+- Jameis Winston, who had not, resolved to a **66-attempt 2025** season.
+
+Two players on the same depth chart, measured over different spans, sorted against each other
+and fed to a model whose constants were fitted on full seasons. `getAthleteSeason(id, season)`
+now pins the requested season and falls back only to the most recent **earlier** one.
+
+This is also how a backup displaced a starter in the matchup view. The QB selection had a
+fallback — if the resolved starter wasn't in the stats pool, take whoever threw most — and
+"threw most" was Winston's full 2025 against Dart's single 2026 game. **Never substitute a
+different player for the one you resolved.** If the confirmed starter has no prior line
+(a rookie, a first-time starter), show him with what exists and say so.
+
+Verified after the fix, Week 2 2026, all 32 teams: NYG resolves to Jaxson Dart, NE to Drake
+Maye, WSH promotes Marcus Mariota (Jayden Daniels Doubtful), SEA promotes Drew Lock
+(Sam Darnold Out).
+
 ## Season rollover
 
 In early September the new season exists on the scoreboard but every stat endpoint still
