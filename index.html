@@ -109,7 +109,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
  *  - teamrankings.com is NOT CORS-open; a browser page can never fetch it
  * ==================================================================== */
 
-const BUILD = "v10 · 2026-10-04";
+const BUILD = "v11 · 2026-10-06";
 
 const ESPN      = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_V2   = "https://site.api.espn.com/apis/v2/sports/football/nfl";
@@ -269,7 +269,30 @@ function ordinal(n) {
 const store = {
   get(k) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } },
+  keys(prefix) {
+    try {
+      const out = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf(prefix) === 0) out.push(k);
+      }
+      return out;
+    } catch { return []; }
+  },
 };
+
+/** Which weeks actually have a pre-kickoff projection snapshot on this device.
+ *  The report card enumerates from storage rather than counting up to the
+ *  current week: ESPN's unparameterized scoreboard flips its week marker on its
+ *  own schedule, and a strictly-less-than bound against it silently hid the
+ *  week that had just finished. */
+function snapshotWeeks(year) {
+  const pre = `gx_proj_${year}_`;
+  return store.keys(pre)
+    .map((k) => +k.slice(pre.length))
+    .filter((w) => isFinite(w) && w > 0)
+    .sort((a, b) => a - b);
+}
 
 /* ------------------------------ grading ------------------------------ */
 
@@ -1286,17 +1309,26 @@ async function weekActuals(games) {
  * away. Those are separated out rather than silently averaged in.
  */
 async function gradeWeek(year, week, force) {
-  const gk = `gx_grade_${year}_${week}_v10`;
+  const gk = `gx_grade_${year}_${week}_v11`;
   if (!force) { const c = store.get(gk); if (c) return c; }
   const snap = store.get(`gx_proj_${year}_${week}`);
-  if (!snap?.rows?.length) return null;
+  if (!snap?.rows?.length) return { week, year, reason: "nosnap" };
   const { games } = await getSchedule(year, week, 2);
-  if (!games.length) return null;
-  const done = games.filter(hasStarted);
-  if (!done.length) return null;
+  if (!games.length) return { week, year, reason: "noschedule" };
 
-  const actual = await weekActuals(done);
-  const picks = snap.rows.map((r) => {
+  /* Only FINAL games can be scored. A game in progress has a partial box score,
+     and grading off it understates every player in it. Picks from games that
+     are not final yet are held back rather than counted as misses. */
+  const isFinal = (g) => g.state === "post" || g.completed === true;
+  const final = games.filter(isFinal);
+  const finalIds = new Set(final.map((g) => String(g.id)));
+  if (!final.length) return { week, year, reason: "notfinal", gamesTotal: games.length, gamesFinal: 0 };
+
+  const gradable = snap.rows.filter((r) => !r.gameId || finalIds.has(String(r.gameId)));
+  if (!gradable.length) return { week, year, reason: "notfinal", gamesTotal: games.length, gamesFinal: final.length };
+
+  const actual = await weekActuals(final);
+  const picks = gradable.map((r) => {
     const a = actual[r.id] || null;
     const act = a ? a[r.stat] : undefined;
     const played = act !== undefined && !isNaN(act);
@@ -1320,15 +1352,21 @@ async function gradeWeek(year, week, force) {
     };
   });
 
+  const complete = final.length === games.length;
   const result = {
-    year, week, gradedAt: Date.now(), version: 10,
+    year, week, gradedAt: Date.now(), version: 11,
     projected: picks.length,
     played: picks.filter((p) => p.played).length,
     dnp: picks.filter((p) => !p.played).length,
     flagged: picks.filter((p) => p.played && p.collapsed).length,
+    gamesTotal: games.length, gamesFinal: final.length, complete,
+    heldBack: snap.rows.length - gradable.length,
+    snapshotAt: snap.savedAt || null,
     picks,
   };
-  store.set(gk, result);
+  /* Never cache a half-finished week — the old build froze a Sunday-afternoon
+     grade in place and never revisited it after the night games. */
+  if (complete) store.set(gk, result);
   return result;
 }
 
@@ -1391,6 +1429,16 @@ function summarise(picks) {
  * ============================================================ */
 const OVER_C = "#ffc72c";
 const UNDER_C = "#e5484d";
+
+/** Why a week isn't on the board — said plainly, because silent omission is
+ *  exactly what made the last missing week take a debugging round to find. */
+const GAP_TEXT = (x) => {
+  if (x.reason === "nosnap") return "no projections were saved — the Edge Board wasn't open for this week before its games kicked off, so there is nothing to grade against.";
+  if (x.reason === "notfinal") return `still in progress — ${x.gamesFinal || 0} of ${x.gamesTotal || "?"} games final.`;
+  if (x.reason === "noschedule") return "ESPN returned no schedule for this week.";
+  if (x.reason === "error") return `grading failed — ${x.detail || "unknown error"}.`;
+  return "not gradeable.";
+};
 
 const COHORTS = [
   { key: "top3", label: "Top 3 / position" },
@@ -1582,16 +1630,26 @@ function ReportCard({ year, currentWeek }) {
   const [cohort, setCohort] = useState("top3");
   const [weekSel, setWeekSel] = useState("all");
   const [showTable, setShowTable] = useState(false);
+  const [gaps, setGaps] = useState([]);
 
   const load = useCallback(async (force) => {
     setBusy(true); setMsg("");
-    const out = [];
-    for (let w = 1; w < Math.max(currentWeek || 1, 1); w++) {
-      if (!store.get(`gx_proj_${year}_${w}`)) continue;
+    const out = [], miss = [];
+    const have = new Set(snapshotWeeks(year));
+    /* Walk every week that could possibly be gradeable: up to the current week
+       INCLUSIVE, plus any week a snapshot exists for. The old bound stopped one
+       short of ESPN's reported week, which hid a week that had just gone final. */
+    const last = Math.max(currentWeek || 1, ...(have.size ? [...have] : [1]), 1);
+    for (let w = 1; w <= last; w++) {
+      const past = w < (currentWeek || 1);
+      if (!have.has(w)) { if (past) miss.push({ week: w, reason: "nosnap" }); continue; }
       setMsg(`Grading week ${w}…`);
-      try { const g = await gradeWeek(year, w, force); if (g) out.push(g); } catch {}
+      let g = null;
+      try { g = await gradeWeek(year, w, force); }
+      catch (e) { miss.push({ week: w, reason: "error", detail: e.message }); continue; }
+      if (g && g.picks) out.push(g); else if (g) miss.push({ week: w, ...g });
     }
-    setGrades(out); setBusy(false); setMsg("");
+    setGrades(out); setGaps(miss); setBusy(false); setMsg("");
   }, [year, currentWeek]);
   useEffect(() => { load(false); }, [load]);
 
@@ -1654,8 +1712,33 @@ function ReportCard({ year, currentWeek }) {
 
         {!busy && !grades.length && (
           <Panel style={{ padding: "20px 18px", fontSize: 12, color: T.inkDim, lineHeight: 1.6 }}>
-            No graded weeks yet. Projections are snapshotted every time the Edge Board scans a
-            week — come back once those games are final.
+            No graded weeks yet. A week becomes gradeable once the Edge Board has scanned it
+            <em> before kickoff</em> and its games are final.
+          </Panel>
+        )}
+
+        {!busy && (gaps.length > 0 || grades.some((g) => !g.complete)) && (
+          <Panel style={{ padding: "13px 16px", marginBottom: 12 }}>
+            <div style={{ fontSize: 10, color: T.inkFaint, letterSpacing: 1, marginBottom: 9 }}>
+              WEEK COVERAGE
+            </div>
+            {grades.filter((g) => !g.complete).map((g) => (
+              <div key={`p${g.week}`} style={{ fontSize: 11.5, color: T.ink, marginBottom: 5 }}>
+                <b style={{ color: OVER_C }}>Week {g.week}</b> — graded on {g.gamesFinal} of{" "}
+                {g.gamesTotal} games. {g.heldBack > 0 ? `${g.heldBack} picks held back until the rest are final.` : "Re-grade once the week finishes."}
+              </div>
+            ))}
+            {gaps.map((x) => (
+              <div key={`g${x.week}`} style={{ fontSize: 11.5, color: T.inkDim, marginBottom: 5 }}>
+                <b style={{ color: T.chalk }}>Week {x.week}</b> — {GAP_TEXT(x)}
+              </div>
+            ))}
+            <div style={{ fontSize: 9.5, color: T.inkFaint, marginTop: 9, lineHeight: 1.5 }}>
+              A week can only be graded from a snapshot taken while its games were still
+              upcoming. Rebuilding one after the fact would feed the results back into the
+              projection that is meant to predict them, so missed weeks stay missed. The board
+              now pre-snapshots next week automatically whenever you scan this one.
+            </div>
           </Panel>
         )}
 
@@ -2738,6 +2821,28 @@ function App() {
   }, [league, tables, env, week, year, seasonType]);
 
   useEffect(() => { doScan(false); }, [doScan]);
+
+  /* Insurance against a lost week. A week is only gradeable from projections
+     captured before its games kicked off, and that used to require remembering
+     to open the app mid-week. Once this week's scan lands, quietly scan NEXT
+     week in the background and snapshot it. Nothing renders from it; it just
+     means skipping a week no longer erases it from the Over Board. */
+  const preSnapped = useRef(new Set());
+  useEffect(() => {
+    if (!scan || scan.error || scanning || !league || !tables || !env || !week) return;
+    if (seasonType !== 2) return;
+    const nw = week + 1;
+    if (nw > 18 || preSnapped.current.has(nw)) return;
+    preSnapped.current.add(nw);
+    if (store.get(`gx_proj_${year}_${nw}`)) return;
+    (async () => {
+      try {
+        const s = await getSchedule(year, nw, 2);
+        if (!s.games.length || s.games.every(hasStarted)) return;
+        await runScan({ year, week: nw, seasonType: 2, league, tables, env });
+      } catch {}
+    })();
+  }, [scan, scanning, league, tables, env, week, year, seasonType]);
 
   const weeks = seasonType === 2 ? 18 : 5;
 
