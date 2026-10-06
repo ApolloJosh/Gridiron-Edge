@@ -109,7 +109,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
  *  - teamrankings.com is NOT CORS-open; a browser page can never fetch it
  * ==================================================================== */
 
-const BUILD = "v8 · 2026-09-21";
+const BUILD = "v10 · 2026-10-04";
 
 const ESPN      = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_V2   = "https://site.api.espn.com/apis/v2/sports/football/nfl";
@@ -154,6 +154,36 @@ const OPP_RATIO_CLAMP = [0.80, 1.20];
  * 3. 17% of projected players never recorded a line; backup QBs were being
  *    ranked as if they'd start. Depth charts now gate the board: 17.2% -> 9.0%.
  */
+/* ---- WEEKS 2-3 2026 POST-MORTEM — see docs/week1-2026.md ----
+ * The report card flagged a large, GROWING quarterback bias: -24.0 then -36.1
+ * (negative = projecting too low). Decomposed against live results, n=28/29:
+ *
+ *   shipped (pool-mean shrink)      wk2 -24.0   wk3 -36.1
+ *   no shrink                       wk2  -9.2   wk3 -22.6
+ *   + league environment scalar     wk2  -5.9   wk3 -19.0
+ *   + starts-only baseline          wk2  +1.2   wk3 -12.0
+ *
+ * Three separate causes, each fixed below:
+ *
+ * 1. SHRINKAGE TOWARD THE WRONG MEAN. The QB pool is 31 starters and 29
+ *    backups, so its mean per-game is 174.9 — but the mean of the players we
+ *    actually project is 218.6. Since v7 only projects starters, shrinking
+ *    them toward a backup-contaminated mean was a pure downward push. The
+ *    positional mean is now computed over the PROJECTED population.
+ * 2. RELIEF APPEARANCES IN THE BASELINE. A quarterback's prior-season game
+ *    log mixes starts with mop-up and injury-shortened outings. Averaging
+ *    them understates what he does when he starts. QB baselines now use games
+ *    with >= QB_START_ATT attempts (fallback to all if fewer than 3 qualify).
+ *    This is QB-specific on purpose: for a committee back or a WR3, low-usage
+ *    games ARE part of the distribution.
+ * 3. LEAGUE ENVIRONMENT DRIFT. 2026 passing is up and rushing is down against
+ *    2025. Projecting off last season without that correction is a standing
+ *    bias. Scalars are measured from completed current-season games and
+ *    clamped; env is computed from weeks BEFORE the projected one.
+ */
+const QB_START_ATT = 15;          // 20 tested marginally better; 15 keeps sample size
+const ENV_CLAMP = [0.92, 1.08];
+
 const SHRINK       = { QB: 0.90, REC: 0.85, RB: 1.00 }; // within-season, 2025-validated
 const SHRINK_CROSS = { QB: 0.80, REC: 0.82, RB: 0.97 }; // projecting across an offseason
 const POS_MEAN_FALLBACK = { QB: 208, REC: 34, RB: 37 }; // 2025 per-game means, recomputed at scan time
@@ -338,8 +368,10 @@ function hasStarted(g) {
  * 272 games ~ 6 seconds, then cached.
  * ============================================================ */
 
-async function buildSeasonDB(season, onProgress) {
-  const key = `gx_db_${season}_v5`;
+async function buildSeasonDB(season, onProgress, liveKeySuffix) {
+  /* A finished season is immutable and caches forever. An in-progress one
+     gains games every week, so its key carries a suffix that changes. */
+  const key = `gx_db_${season}_v5${liveKeySuffix ? "_" + liveKeySuffix : ""}`;
   const cached = store.get(key);
   if (cached?.rows?.length) return cached;
 
@@ -389,6 +421,25 @@ async function buildSeasonDB(season, onProgress) {
   const db = { season, rows, builtAt: Date.now(), games: events.length };
   store.set(key, db);
   return db;
+}
+
+/**
+ * League scoring environment: current season vs the season we project from.
+ * Returns multipliers for passing and rushing, clamped, 1.0 when we're already
+ * projecting from the current year or there isn't a usable sample yet.
+ */
+function leagueEnv(currentDb, priorTables) {
+  const blank = { pass: 1, rush: 1, n: 0 };
+  if (!currentDb?.rows?.length || !priorTables?.league) return blank;
+  const rows = currentDb.rows;
+  if (rows.length < 24) return blank;           // under ~12 games, too noisy
+  const pass = mean(rows.map((r) => r.passYds || 0));
+  const rush = mean(rows.map((r) => r.rushYds || 0));
+  return {
+    pass: clamp(pass / priorTables.league.passYdsPg, ...ENV_CLAMP),
+    rush: clamp(rush / priorTables.league.rushYdsPg, ...ENV_CLAMP),
+    n: rows.length,
+  };
 }
 
 /**
@@ -787,9 +838,23 @@ function analyze(p, kind, ctx) {
       { label: "INT%", value: isNaN(intPct) ? "—" : intPct.toFixed(1) + "%", g: g6 },
       { label: "TD/G", value: fmt(td / G) }, { label: "RUSH/G", value: fmt(rush / G) },
     ];
-    /* passing does NOT blend to recency — last-3 was 7% worse in the backtest */
-    const base = shrinkBaseline(log ? mean(logVals("passingYards")) : yds / G, "QB", ctx);
-    dist = distribution(logVals("passingYards"));
+    /* Passing does NOT blend to recency — last-3 was 7% worse in the backtest.
+       But it DOES exclude relief appearances: averaging mop-up duty into a
+       starter's baseline understates him by ~10 yards a game (measured). */
+    const startGames = log
+      ? log.filter((g) => num(g.stats.passingAttempts) >= QB_START_ATT)
+      : [];
+    const startVals = startGames.map((g) => num(g.stats.passingYards)).filter((x) => !isNaN(x));
+    const allVals = logVals("passingYards");
+    const rawBase = startVals.length >= 3 ? mean(startVals)
+      : (log && allVals.length ? mean(allVals) : yds / G);
+    const base = shrinkBaseline(rawBase, "QB", ctx) * (ctx.env?.pass || 1);
+    const startsUsed = startVals.length >= 3 ? startVals.length : null;
+    const attPool = startGames.length >= 3
+      ? startGames.map((g) => num(g.stats.passingAttempts)).filter((x) => !isNaN(x))
+      : (log ? log.map((g) => num(g.stats.passingAttempts)).filter((x) => !isNaN(x)) : []);
+    var baselineAtt = attPool.length ? mean(attPool) : (att / G);
+    dist = distribution(startVals.length >= 3 ? startVals : logVals("passingYards"));
     projected = { passYds: base * passMult, passTd: (td / G) * passMult, ints: ints / G, rushYds: rush / G };
     projLabels = [
       { key: "passYds", label: "PASS YDS", d: 1, headline: true, logKey: "passingYards" },
@@ -800,6 +865,8 @@ function analyze(p, kind, ctx) {
       { key: "def", label: `${ctx.defAbbr} allows ${fmt(D?.passYdsPg)} pass yds/g (${ordinal(D?.rankPassYds)})`,
         mult: passMult, active: !!D, note: `ratio^${PASS_OPP_EXP}` },
     ];
+    if (startsUsed) factors.push({ key: "starts", label: `${startsUsed} starts only (relief games excluded)`,
+      mult: 1, active: true, note: "baseline population" });
   } else if (kind === "REC") {
     phase = "pass";
     const rec = num(receiving.receptions), yds = num(receiving.receivingYards),
@@ -815,7 +882,7 @@ function analyze(p, kind, ctx) {
       { label: "REC/G", value: fmt(rec / G), g: g4 }, { label: "YPR", value: fmt(ypr), g: g3 },
       { label: "TD", value: int(td) }, { label: "YDS", value: int(yds), sub: isNaN(G) ? "" : `${int(G)}g` },
     ];
-    const base = shrinkBaseline(log ? mean(logVals("receivingYards")) : yds / G, "REC", ctx);
+    const base = shrinkBaseline(log ? mean(logVals("receivingYards")) : yds / G, "REC", ctx) * (ctx.env?.pass || 1);
     dist = distribution(logVals("receivingYards"));
     projected = { recYds: base * passMult, rec: (rec / G) * passMult, tgt: tgt / G, td: (td / G) * passMult };
     projLabels = [
@@ -846,7 +913,7 @@ function analyze(p, kind, ctx) {
     const carSeason = carAll.length ? mean(carAll) : car / G;
     const carRecent = carAll.length >= 3 ? mean(lastN(carAll, 3)) : carSeason;
     const projCar = CARRY_RECENCY * carRecent + (1 - CARRY_RECENCY) * carSeason;
-    const base = shrinkBaseline(log ? mean(logVals("rushingYards")) : yds / G, "RB", ctx);
+    const base = shrinkBaseline(log ? mean(logVals("rushingYards")) : yds / G, "RB", ctx) * (ctx.env?.rush || 1);
     dist = distribution(logVals("rushingYards"));
     projected = {
       rushYds: base * rushMult, car: projCar, td: (td / G) * rushMult, recYds: recYds / G,
@@ -891,6 +958,15 @@ function analyze(p, kind, ctx) {
     ];
   }
 
+  if (ctx.env && kind !== "DEF") {
+    const e = phase === "rush" ? ctx.env.rush : ctx.env.pass;
+    if (e && Math.abs(e - 1) > 0.001) {
+      factors.push({
+        key: "env", label: `League ${phase === "rush" ? "rushing" : "passing"} ${e > 1 ? "up" : "down"} vs ${ctx.statSeason || "last season"}`,
+        mult: e, active: true, note: "current-season environment",
+      });
+    }
+  }
   factors.push(weatherFactor(ctx.wx, ctx.indoor, phase === "rush" ? "rush" : "pass"));
   if (ctx.implied != null) {
     factors.push({
@@ -924,6 +1000,7 @@ function analyze(p, kind, ctx) {
     kind, phase, archetype, factors, projected, seasonCells, projLabels, grades,
     score, verdict: edgeVerdict(score), gamesPlayed: G, volume, dist, band, headline,
     oppHistory: ctx.oppHistory || null, log,
+    baselineAtt: typeof baselineAtt === "number" ? baselineAtt : null,
   };
 }
 
@@ -948,7 +1025,7 @@ const SCAN_PULLS = [
 const MIN_VOLUME = { QB: 150, REC: 40, RB: 60, DEF: 30 };
 const MIN_GAMES = 6;
 
-async function runScan({ year, week, seasonType, league, tables, onProgress }) {
+async function runScan({ year, week, seasonType, league, tables, env, onProgress }) {
   onProgress?.("Loading this week's slate…");
   const { games, byes } = await getSchedule(year, week, seasonType);
   if (!games.length) return { rows: [], games, byes, empty: true };
@@ -1014,6 +1091,13 @@ async function runScan({ year, week, seasonType, league, tables, onProgress }) {
   players.forEach((p) => {
     const k = KIND_OF_POS(p.pos);
     if (!posSamples[k]) return;
+    /* Only count players we actually project. The QB pool is roughly half
+       backups, whose low per-game numbers dragged the mean 44 yards below the
+       starters' — and shrinking starters toward that was a standing -9 bias. */
+    if (k === "QB") {
+      const st = starterQB[p.team];
+      if (st && String(p.id) !== st.id) return;
+    }
     const s = p.stats || {};
     const gp = num(statOf(s, ["general", "passing", "rushing", "receiving"], ["gamesPlayed"]));
     if (!(gp > 0)) return;
@@ -1050,7 +1134,7 @@ async function runScan({ year, week, seasonType, league, tables, onProgress }) {
       wx: detail?.weather,
       indoor: meta.game.indoor || detail?.indoor,
       implied: imp ? (meta.home ? imp.home : imp.away) : null,
-      posMean, crossSeason,
+      posMean, crossSeason, env, statSeason: league.season,
     };
     const a = analyze(p, kind, ctx);
     if (a.score === null) continue;
@@ -1101,15 +1185,47 @@ async function runScan({ year, week, seasonType, league, tables, onProgress }) {
  * the model can only be argued about, never checked.
  * ============================================================ */
 
+/**
+ * Snapshot ONLY what the board displays. Grading the full scan counted deep
+ * reserves the board never recommended, which is why the report card showed a
+ * ~19% "never played" rate that no amount of starter-gating moved — those
+ * players were filtered out of the view but still being graded.
+ */
+/* What "he played a normal game" means per position, and what we expected. */
+const USAGE_STAT = { QB: "passingAttempts", RB: "rushingAttempts", REC: "receivingTargets" };
+const USAGE_PROJ = {
+  QB: (a) => a.baselineAtt || null,
+  RB: (a) => (isFinite(a.projected?.car) ? a.projected.car : null),
+  REC: (a) => (isFinite(a.projected?.tgt) ? a.projected.tgt : null),
+};
+/* Below this share of expected workload the game tells us nothing about the
+   matchup read — injury, benching, ejection or a blowout took the sample away. */
+const USAGE_FLOOR = 0.5;
+
+const boardVisible = (r) => {
+  if (r.started) return false;                       // game already kicked off
+  if (r.kind === "DEF" || r.depth == null) return true;
+  const lim = DEPTH_LIMIT[r.pos];
+  return lim === undefined ? true : r.depth <= lim;
+};
+
 function saveProjections(year, week, rows) {
   const snap = rows
+    .filter(boardVisible)
     .filter((r) => r.kind !== "DEF" && r.analysis?.headline?.logKey)
     .map((r) => ({
       id: r.player.id, name: r.player.name, pos: r.pos, kind: r.kind,
       team: r.team, opp: r.opp, stat: r.analysis.headline.logKey,
       proj: r.analysis.projected[r.analysis.headline.key],
+      /* The median is what an over bet is actually priced against — a mean
+         baseline sits above the typical game in a right-skewed distribution. */
+      median: r.analysis.band?.medianAdj,
       p25: r.analysis.band?.p25adj, p75: r.analysis.band?.p75adj,
-      score: r.score, depth: r.depth || null,
+      score: r.score, depth: r.depth || null, gameId: r.game?.id || null,
+      /* Expected workload, so a result can be checked for "did he actually
+         play a normal game" before it is allowed to score the model. */
+      usageStat: USAGE_STAT[r.kind] || null,
+      projUsage: USAGE_PROJ[r.kind] ? USAGE_PROJ[r.kind](r.analysis) : null,
     }))
     .filter((x) => isFinite(x.proj));
   if (snap.length) store.set(`gx_proj_${year}_${week}`, { year, week, savedAt: Date.now(), rows: snap });
@@ -1128,18 +1244,49 @@ async function weekActuals(games) {
           const rec = out[id] = out[id] || {};
           const vals = {};
           keys.forEach((k, i) => { vals[k] = a.stats?.[i]; });
-          if (cat.name === "passing") rec.passingYards = num(vals.passingYards);
-          if (cat.name === "rushing") rec.rushingYards = num(vals.rushingYards);
-          if (cat.name === "receiving") rec.receivingYards = num(vals.receivingYards);
+          if (cat.name === "passing") {
+            rec.passingYards = num(vals.passingYards);
+            const ca = String(vals["completions/passingAttempts"] || "0/0").split("/");
+            rec.passingAttempts = num(ca[1]);
+          }
+          if (cat.name === "rushing") {
+            rec.rushingYards = num(vals.rushingYards);
+            rec.rushingAttempts = num(vals.rushingAttempts);
+          }
+          if (cat.name === "receiving") {
+            rec.receivingYards = num(vals.receivingYards);
+            rec.receivingTargets = num(vals.receivingTargets);
+          }
         });
+      });
+    });
+    /* Current injury status, used only to corroborate a usage collapse — the
+       feed has no in-game participation flag, so workload is the real signal. */
+    (Array.isArray(s?.injuries) ? s.injuries : []).forEach((blk) => {
+      (blk.injuries || []).forEach((x) => {
+        const id = x.athlete?.id;
+        if (!id) return;
+        out[id] = out[id] || {};
+        out[id].injStatus = x.status;
       });
     });
   });
   return out;
 }
 
+/**
+ * Grade a finished week as a BETTOR would read it, not as a modeller would.
+ * The question is not "what was the MAE" — it is: of the picks I would have
+ * taken, how many went over the number, and where in the projected range did
+ * they land.
+ *
+ * Every pick is also checked for whether it was a fair test at all. A back who
+ * saw three carries or a quarterback who threw eight passes tells us nothing
+ * about the matchup — he got hurt, benched, ejected, or the game script ran
+ * away. Those are separated out rather than silently averaged in.
+ */
 async function gradeWeek(year, week, force) {
-  const gk = `gx_grade_${year}_${week}`;
+  const gk = `gx_grade_${year}_${week}_v10`;
   if (!force) { const c = store.get(gk); if (c) return c; }
   const snap = store.get(`gx_proj_${year}_${week}`);
   if (!snap?.rows?.length) return null;
@@ -1149,58 +1296,292 @@ async function gradeWeek(year, week, force) {
   if (!done.length) return null;
 
   const actual = await weekActuals(done);
-  const scored = snap.rows.map((r) => {
-    const a = actual[r.id];
+  const picks = snap.rows.map((r) => {
+    const a = actual[r.id] || null;
     const act = a ? a[r.stat] : undefined;
-    return { ...r, act: (act === undefined || isNaN(act)) ? null : act };
+    const played = act !== undefined && !isNaN(act);
+    /* Older snapshots predate the median; fall back to the point estimate. */
+    const median = isFinite(r.median) ? r.median : r.proj;
+    const usageActual = a && r.usageStat ? a[r.usageStat] : undefined;
+    const usageRatio = (isFinite(r.projUsage) && r.projUsage > 0 && isFinite(usageActual))
+      ? usageActual / r.projUsage : null;
+    const collapsed = usageRatio !== null && usageRatio < USAGE_FLOOR;
+    const band = isFinite(r.p25) && isFinite(r.p75) && r.p75 > r.p25;
+    let zone = null, bandWidths = null;
+    if (played && band) {
+      zone = act > r.p75 ? "above" : act >= median ? "upper" : act >= r.p25 ? "lower" : "below";
+      bandWidths = (act - median) / (r.p75 - r.p25);
+    }
+    return {
+      ...r, median, act: played ? act : null, played,
+      over: played ? act > median : null,
+      zone, bandWidths, usageActual: isFinite(usageActual) ? usageActual : null,
+      usageRatio, collapsed, injStatus: a?.injStatus || null,
+    };
   });
-  const played = scored.filter((r) => r.act !== null);
-  if (!played.length) return null;
-
-  const mae = (rows) => mean(rows.map((r) => Math.abs(r.proj - r.act)));
-  const byKind = {};
-  ["QB", "RB", "REC"].forEach((k) => {
-    const rows = played.filter((r) => r.kind === k);
-    if (rows.length) byKind[k] = { n: rows.length, mae: mae(rows), bias: mean(rows.map((r) => r.proj - r.act)) };
-  });
-  const banded = played.filter((r) => isFinite(r.p25) && isFinite(r.p75));
-  const coverage = banded.length
-    ? banded.filter((r) => r.act >= r.p25 && r.act <= r.p75).length / banded.length * 100 : NaN;
-
-  /* Does a high EDGE actually mean a better outcome? Compare the top and
-     bottom quartiles on how they did against their OWN projection. */
-  const ranked = [...played].filter((r) => r.proj > 0).sort((a, b) => b.score - a.score);
-  const q = Math.max(1, Math.floor(ranked.length / 4));
-  /* Median error, not a ratio. act/proj flatters small baselines — a 20-yard
-     player can triple his average and a 100-yard player cannot — which made
-     the ranking look inverted when it was mostly arithmetic. */
-  const medErr = (rows) => {
-    const d = rows.map((r) => r.proj - r.act).sort((a, b) => a - b);
-    return d.length ? d[Math.floor(d.length / 2)] : NaN;
-  };
-  const beat = (rows) => rows.filter((r) => r.act > r.proj).length / rows.length * 100;
-  const topQ = ranked.slice(0, q), botQ = ranked.slice(-q);
 
   const result = {
-    year, week, gradedAt: Date.now(),
-    projected: snap.rows.length, played: played.length,
-    dnp: snap.rows.length - played.length,
-    overallMae: mae(played), byKind, coverage,
-    edge: {
-      topScore: mean(topQ.map((r) => r.score)), botScore: mean(botQ.map((r) => r.score)),
-      topBias: medErr(topQ), botBias: medErr(botQ),
-      topProd: mean(topQ.map((r) => r.act)), botProd: mean(botQ.map((r) => r.act)),
-      topBeat: beat(topQ), botBeat: beat(botQ), n: q,
-    },
+    year, week, gradedAt: Date.now(), version: 10,
+    projected: picks.length,
+    played: picks.filter((p) => p.played).length,
+    dnp: picks.filter((p) => !p.played).length,
+    flagged: picks.filter((p) => p.played && p.collapsed).length,
+    picks,
   };
   store.set(gk, result);
   return result;
+}
+
+/* ---- cohort maths, shared by the hero, the charts and the table ---- */
+
+const POS_GROUP = (p) => (p.pos === "QB" ? "QB"
+  : ["RB", "FB"].includes(p.pos) ? "RB" : p.pos === "TE" ? "TE" : "WR");
+
+/** "Top N per position" is how the board is actually played. */
+function topNPerPosition(picks, n) {
+  const byPos = {};
+  picks.forEach((p) => { (byPos[POS_GROUP(p)] = byPos[POS_GROUP(p)] || []).push(p); });
+  const out = [];
+  Object.values(byPos).forEach((list) => {
+    out.push(...[...list].sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, n));
+  });
+  return out;
+}
+
+function cohortOf(picks, key) {
+  if (key === "top3") return topNPerPosition(picks, 3);
+  if (key === "top5") return topNPerPosition(picks, 5);
+  if (key === "edge75") return picks.filter((p) => (p.score || 0) >= 75);
+  return picks;
+}
+
+function summarise(picks) {
+  const played = picks.filter((p) => p.played);
+  const clean = played.filter((p) => !p.collapsed);
+  const over = clean.filter((p) => p.over);
+  const zones = { below: 0, lower: 0, upper: 0, above: 0 };
+  clean.forEach((p) => { if (p.zone) zones[p.zone]++; });
+  const zoned = Object.values(zones).reduce((a, b) => a + b, 0);
+  const medErr = (() => {
+    const d = clean.map((p) => p.median - p.act).sort((a, b) => a - b);
+    return d.length ? d[Math.floor(d.length / 2)] : NaN;
+  })();
+  return {
+    n: picks.length, played: played.length, clean: clean.length,
+    flagged: played.length - clean.length, dnp: picks.length - played.length,
+    overN: over.length,
+    overRate: clean.length ? over.length / clean.length * 100 : NaN,
+    bigOver: zoned ? zones.above / zoned * 100 : NaN,
+    bust: zoned ? zones.below / zoned * 100 : NaN,
+    zones, zoned, medErr,
+  };
+}
+
+/* ====================== THE OVER BOARD ======================
+ * Palette note. OVER uses the brand gold #ffc72c, UNDER the reserved critical
+ * step #e5484d. Validated against this app's dark green surface #0a2d1a:
+ * CVD separation ΔE 24.0 deutan / 25.9 tritan, normal-vision 29.9, contrast
+ * above 3:1 on both. The validator's lightness-band check FAILS on the gold
+ * (L 0.857 vs the dark band 0.48–0.67) and that deviation is deliberate: the
+ * band exists to stop one series dominating a CATEGORICAL set, while this is a
+ * two-pole status encoding. Every band-passing gold tested collapsed CVD
+ * separation from ΔE 24 to ~7, which is the floor where colour alone stops
+ * working. Both poles carry an arrow and a text label, so identity never rests
+ * on hue, and a table view of the same rows sits below the charts.
+ * ============================================================ */
+const OVER_C = "#ffc72c";
+const UNDER_C = "#e5484d";
+
+const COHORTS = [
+  { key: "top3", label: "Top 3 / position" },
+  { key: "top5", label: "Top 5 / position" },
+  { key: "edge75", label: "EDGE 75+" },
+  { key: "all", label: "Everything" },
+];
+
+function StatTile({ label, value, sub, tone }) {
+  return (
+    <div style={{ minWidth: 118 }}>
+      <div style={{ fontSize: 9, color: T.inkFaint, letterSpacing: .8 }}>{label}</div>
+      <div style={{
+        fontFamily: "'Barlow Condensed',sans-serif", fontSize: 26, fontWeight: 700,
+        lineHeight: 1.1, color: tone || T.chalk,
+      }}>{value}</div>
+      {sub && <div style={{ fontSize: 9, color: T.inkFaint }}>{sub}</div>}
+    </div>
+  );
+}
+
+/**
+ * Where each pick landed, measured in band-widths from its own median.
+ *
+ * Built in HTML rather than SVG on purpose: a percent-width SVG needs
+ * preserveAspectRatio="none", which stretches tick labels into illegibility and
+ * turns the dots into ellipses. Absolutely-positioned divs keep circles round
+ * and text upright at any container width.
+ */
+function LandingChart({ picks }) {
+  const [hover, setHover] = useState(null);
+  const CAP = 24;      // a 150-row strip helps nobody; the top of the board is the point
+  const eligible = picks.filter((p) => p.played && p.bandWidths !== null && !p.collapsed)
+    .sort((a, b) => (b.score || 0) - (a.score || 0));
+  const rows = eligible.slice(0, CAP);
+  if (!rows.length) return null;
+
+  const LIM = 2;
+  const xPct = (v) => ((clamp(v, -LIM, LIM) + LIM) / (2 * LIM)) * 100;
+  const ticks = [-2, -1, 0, 1, 2];
+  const PLOT = "52%";          // plot column; labels sit either side
+
+  const Legend = () => (
+    <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, color: T.inkDim }}>
+        <span style={{ width: 10, height: 10, borderRadius: "50%", background: OVER_C, display: "inline-block" }} />
+        ▲ Over the median
+      </span>
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, color: T.inkDim }}>
+        <span style={{ width: 10, height: 10, borderRadius: "50%", background: UNDER_C, display: "inline-block" }} />
+        ▼ Under the median
+      </span>
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, color: T.inkFaint }}>
+        <span style={{ width: 18, height: 5, borderRadius: 3, background: "rgba(255,255,255,.26)", display: "inline-block" }} />
+        projected 25–75 range
+      </span>
+    </div>
+  );
+
+  return (
+    <div>
+      <Legend />
+      <div style={{ fontSize: 10, color: hover ? T.chalk : T.inkFaint, minHeight: 15, marginBottom: 6 }}>
+        {hover
+          ? `${hover.name} · ${hover.team} vs ${hover.opp} · median ${hover.median.toFixed(0)}, range ${hover.p25.toFixed(0)}–${hover.p75.toFixed(0)} · actual ${hover.act.toFixed(0)} (${hover.bandWidths >= 0 ? "+" : ""}${hover.bandWidths.toFixed(2)} band-widths)`
+          : "0 = his projected median. ±1 = one full band-width away."}
+      </div>
+
+      {/* axis */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, paddingBottom: 4 }}>
+        <div style={{ flex: "1 1 0", minWidth: 0 }} />
+        <div style={{ width: PLOT, position: "relative", height: 13, flexShrink: 0 }}>
+          {ticks.map((t) => (
+            <span key={t} style={{
+              position: "absolute", left: `${xPct(t)}%`, transform: "translateX(-50%)",
+              fontSize: 9, color: t === 0 ? T.chalk : T.inkFaint, whiteSpace: "nowrap",
+            }}>{t === 0 ? "median" : t > 0 ? `+${t}` : t}</span>
+          ))}
+        </div>
+        <div style={{ width: 92, flexShrink: 0 }} />
+      </div>
+
+      {eligible.length > rows.length && (
+        <div style={{ fontSize: 9.5, color: T.inkFaint, marginBottom: 4 }}>
+          Showing the top {CAP} by EDGE of {eligible.length} clean picks — the rest are in the table view.
+        </div>
+      )}
+      {rows.map((p) => {
+        const w = p.p75 - p.p25;
+        const lo = xPct((p.p25 - p.median) / w), hi = xPct((p.p75 - p.median) / w);
+        const c = p.over ? OVER_C : UNDER_C;
+        const on = hover && hover.key === p.key;
+        return (
+          <div key={p.key}
+            onMouseEnter={() => setHover(p)} onMouseLeave={() => setHover(null)}
+            style={{
+              display: "flex", alignItems: "center", gap: 10, height: 28,
+              background: on ? "rgba(255,255,255,.05)" : "transparent", borderRadius: 3,
+            }}>
+            <div style={{
+              flex: "1 1 0", minWidth: 0, fontSize: 11, textAlign: "right",
+              whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+            }}>
+              <span style={{ color: c, fontWeight: 700 }}>{p.over ? "▲" : "▼"}</span>{" "}
+              <span style={{ color: T.ink }}>{p.name}</span>
+              <span style={{ color: T.inkFaint }}> · {p.pos} · {p.score}</span>
+            </div>
+
+            <div style={{ width: PLOT, position: "relative", height: 28, flexShrink: 0 }}
+              title={`${p.name} (${p.pos} ${p.team} vs ${p.opp}) — median ${p.median.toFixed(0)}, actual ${p.act.toFixed(0)}`}>
+              {/* median rule */}
+              <div style={{
+                position: "absolute", left: "50%", top: 0, bottom: 0, width: 1,
+                background: "rgba(255,255,255,.3)",
+              }} />
+              {/* projected range */}
+              <div style={{
+                position: "absolute", left: `${lo}%`, width: `${Math.max(hi - lo, 0.6)}%`,
+                top: "50%", marginTop: -2.5, height: 5, borderRadius: 3,
+                background: "rgba(255,255,255,.26)",
+              }} />
+              {/* actual */}
+              <div style={{
+                position: "absolute", left: `${xPct(p.bandWidths)}%`, top: "50%",
+                width: on ? 13 : 11, height: on ? 13 : 11, marginTop: on ? -6.5 : -5.5,
+                marginLeft: on ? -6.5 : -5.5, borderRadius: "50%", background: c,
+                border: "2px solid #0a2d1a", boxSizing: "content-box",
+              }} />
+            </div>
+
+            <div style={{ width: 92, flexShrink: 0, fontSize: 11, color: T.inkDim, whiteSpace: "nowrap" }}>
+              <strong style={{ color: T.chalk }}>{p.act.toFixed(0)}</strong>
+              <span style={{ color: T.inkFaint }}> vs {p.median.toFixed(0)}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Ordered-scale share, centred on the median. */
+function ZoneBar({ zones, zoned }) {
+  if (!zoned) return null;
+  /* Ordered arms either side of the median: two steps per arm, darker toward
+     the middle. Opacity was tried first and turned the inner segments to mud
+     against the green surface. */
+  const seg = [
+    { k: "below", label: "Under the 25th", c: UNDER_C,   ink: "#1a1208" },
+    { k: "lower", label: "25th → median", c: "#8f3034", ink: "#f2f7f3" },
+    { k: "upper", label: "median → 75th", c: "#9c7718", ink: "#f2f7f3" },
+    { k: "above", label: "Over the 75th", c: OVER_C,    ink: "#1a1208" },
+  ];
+  return (
+    <div>
+      <div style={{ display: "flex", height: 26, borderRadius: 3, overflow: "hidden", gap: 2 }}>
+        {seg.map((x) => {
+          const pct = zones[x.k] / zoned * 100;
+          if (!pct) return null;
+          return (
+            <div key={x.k} title={`${x.label}: ${zones[x.k]} of ${zoned}`}
+              style={{
+                width: `${pct}%`, background: x.c,
+                display: "flex", alignItems: "center", justifyContent: "center",
+              }}>
+              <span style={{ fontSize: 10, fontWeight: 700, color: x.ink }}>
+                {pct >= 9 ? Math.round(pct) + "%" : ""}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 6 }}>
+        {seg.map((x) => (
+          <span key={x.k} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 9.5, color: T.inkDim }}>
+            <span style={{ width: 9, height: 9, borderRadius: 2, background: x.c, display: "inline-block" }} />
+            {x.label} <span style={{ color: T.inkFaint }}>({zones[x.k]})</span>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function ReportCard({ year, currentWeek }) {
   const [grades, setGrades] = useState([]);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const [cohort, setCohort] = useState("top3");
+  const [weekSel, setWeekSel] = useState("all");
+  const [showTable, setShowTable] = useState(false);
 
   const load = useCallback(async (force) => {
     setBusy(true); setMsg("");
@@ -1212,112 +1593,221 @@ function ReportCard({ year, currentWeek }) {
     }
     setGrades(out); setBusy(false); setMsg("");
   }, [year, currentWeek]);
-
   useEffect(() => { load(false); }, [load]);
 
-  const cell = (v, d = 1, suffix = "") => (isFinite(v) ? v.toFixed(d) + suffix : "—");
+  const allPicks = useMemo(() => {
+    const src = weekSel === "all" ? grades : grades.filter((g) => g.week === +weekSel);
+    return src.flatMap((g) => g.picks.map((p, i) => ({ ...p, week: g.week, key: `${g.week}-${p.id}-${i}` })));
+  }, [grades, weekSel]);
+
+  const picks = useMemo(() => cohortOf(allPicks, cohort), [allPicks, cohort]);
+  const sum = useMemo(() => summarise(picks), [picks]);
+  const flagged = picks.filter((p) => p.played && p.collapsed);
+  const byPos = useMemo(() => {
+    const g = {};
+    picks.forEach((p) => { (g[POS_GROUP(p)] = g[POS_GROUP(p)] || []).push(p); });
+    return Object.entries(g).map(([k, v]) => [k, summarise(v)]).sort((a, b) => b[1].clean - a[1].clean);
+  }, [picks]);
+
+  const rateTone = (r) => (isNaN(r) ? T.inkFaint : r >= 55 ? OVER_C : r < 45 ? UNDER_C : T.chalk);
 
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-      <div style={{ flexShrink: 0, marginBottom: 14 }}>
+      <div style={{ flexShrink: 0, marginBottom: 12 }}>
         <div style={{
           fontFamily: "'Barlow Condensed',sans-serif", fontSize: 32, fontWeight: 700,
           letterSpacing: 1.5, color: T.chalk, textShadow: `0 2px 0 ${T.leatherDark}`,
-        }}>REPORT <span style={{ color: T.gold }}>CARD</span></div>
+        }}>THE OVER <span style={{ color: OVER_C }}>BOARD</span></div>
         <div style={{ fontSize: 11.5, color: T.inkDim, marginTop: 3 }}>
-          Every scan is snapshotted and scored once the week is final. This is the tool
-          checking its own work.
+          Of the picks you'd actually have taken, how many cleared their projected median —
+          and where in the range they landed.
         </div>
       </div>
 
+      <div className="gx-tabs" style={{ display: "flex", gap: 6, marginBottom: 12, flexShrink: 0, flexWrap: "wrap", alignItems: "center" }}>
+        {COHORTS.map((c) => (
+          <button key={c.key} onClick={() => setCohort(c.key)} style={{
+            padding: "6px 12px", fontSize: 12, fontWeight: 700, borderRadius: 3, cursor: "pointer",
+            background: cohort === c.key ? OVER_C : "rgba(0,0,0,.3)",
+            color: cohort === c.key ? T.leatherDark : T.ink,
+            border: `1px solid ${cohort === c.key ? OVER_C : T.chalkDim}`,
+            fontFamily: "'Barlow Condensed',sans-serif", letterSpacing: .8, minHeight: 34,
+          }}>{c.label}</button>
+        ))}
+        <select value={weekSel} onChange={(e) => setWeekSel(e.target.value)} style={{ marginLeft: 4 }}>
+          <option value="all">All weeks</option>
+          {grades.map((g) => <option key={g.week} value={g.week}>Week {g.week}</option>)}
+        </select>
+        <button onClick={() => setShowTable((v) => !v)} style={{
+          padding: "6px 12px", fontSize: 11, fontWeight: 600, borderRadius: 3, cursor: "pointer",
+          background: "rgba(0,0,0,.3)", color: T.inkDim, border: `1px solid ${T.chalkDim}`, minHeight: 34,
+        }}>{showTable ? "Hide table" : "Table view"}</button>
+        <button onClick={() => load(true)} disabled={busy} style={{
+          marginLeft: "auto", padding: "6px 12px", fontSize: 11, fontWeight: 600, borderRadius: 3,
+          cursor: busy ? "default" : "pointer", background: "rgba(0,0,0,.3)",
+          color: busy ? T.inkFaint : T.ink, border: `1px solid ${T.chalkDim}`, minHeight: 34,
+        }}>{busy ? "Grading…" : "↻ Re-grade"}</button>
+      </div>
+
       <div style={{ flex: 1, overflowY: "auto", paddingRight: 5 }}>
-        {busy && <Panel style={{ padding: 22 }}><span className="pulsing" style={{ color: T.gold, fontSize: 12 }}>{msg || "Grading…"}</span></Panel>}
+        {busy && <Panel style={{ padding: 22 }}><span className="pulsing" style={{ color: OVER_C, fontSize: 12 }}>{msg || "Grading…"}</span></Panel>}
 
         {!busy && !grades.length && (
           <Panel style={{ padding: "20px 18px", fontSize: 12, color: T.inkDim, lineHeight: 1.6 }}>
-            No graded weeks yet. Projections are saved automatically each time the Edge Board
-            scans a week — come back after those games finish and this fills in.
-            <div style={{ fontSize: 10, color: T.inkFaint, marginTop: 8 }}>
-              Snapshots live in this browser's local storage, so grading only covers weeks
-              scanned on this machine.
-            </div>
+            No graded weeks yet. Projections are snapshotted every time the Edge Board scans a
+            week — come back once those games are final.
           </Panel>
         )}
 
-        {!busy && grades.map((g) => (
-          <Panel key={g.week} style={{ marginBottom: 12, overflow: "hidden" }}>
-            <div style={{
-              padding: "9px 13px", background: "rgba(0,0,0,.22)", display: "flex",
-              alignItems: "center", gap: 10, flexWrap: "wrap",
-            }}>
-              <span style={{
-                fontFamily: "'Barlow Condensed',sans-serif", fontSize: 18, fontWeight: 700,
-                letterSpacing: 1, color: T.chalk,
-              }}>WEEK {g.week}</span>
-              <Badge label={`${g.played} graded`} />
-              {g.dnp > 0 && <Badge label={`${g.dnp} never played`} tone={g.dnp / g.projected > .12 ? "cold" : "neutral"} />}
-              <span style={{ marginLeft: "auto", fontSize: 10, color: T.inkFaint }}>
-                band coverage {cell(g.coverage, 1, "%")} <span style={{ opacity: .7 }}>(ideal 50)</span>
-              </span>
-            </div>
-            <ChalkLine />
-            <div style={{ padding: "11px 13px" }}>
-              <div className="gx-statgrid" style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
-                {Object.entries(g.byKind).map(([k, v]) => (
-                  <div key={k} style={{ minWidth: 92 }}>
-                    <div style={{ fontSize: 9, color: T.inkFaint, letterSpacing: .5 }}>
-                      {k === "REC" ? "WR/TE" : k} · n={v.n}
-                    </div>
-                    <div style={{
-                      fontFamily: "'Barlow Condensed',sans-serif", fontSize: 20,
-                      fontWeight: 700, color: T.chalk,
-                    }}>{cell(v.mae)} <span style={{ fontSize: 10, color: T.inkFaint }}>MAE</span></div>
-                    <div style={{ fontSize: 9, color: Math.abs(v.bias) < 5 ? T.good : T.bad }}>
-                      bias {v.bias > 0 ? "+" : ""}{cell(v.bias)}
-                    </div>
+        {!busy && grades.length > 0 && (
+          <>
+            {/* the one number */}
+            <Panel style={{ padding: "16px 18px", marginBottom: 12 }}>
+              <div style={{ display: "flex", gap: 26, flexWrap: "wrap", alignItems: "flex-end" }}>
+                <div>
+                  <div style={{ fontSize: 10, color: T.inkFaint, letterSpacing: 1 }}>OVER THE PROJECTED MEDIAN</div>
+                  <div style={{
+                    fontFamily: "'Barlow Condensed',sans-serif", fontSize: 56, fontWeight: 700,
+                    lineHeight: 1, color: rateTone(sum.overRate),
+                  }}>{isNaN(sum.overRate) ? "—" : Math.round(sum.overRate) + "%"}</div>
+                  <div style={{ fontSize: 11, color: T.inkDim }}>
+                    {sum.overN} of {sum.clean} clean picks · {COHORTS.find((c) => c.key === cohort).label}
                   </div>
+                </div>
+                <div style={{ display: "flex", gap: 22, flexWrap: "wrap", paddingBottom: 4 }}>
+                  <StatTile label="BIG OVERS" value={isNaN(sum.bigOver) ? "—" : Math.round(sum.bigOver) + "%"}
+                    sub="cleared the 75th" tone={OVER_C} />
+                  <StatTile label="BUSTS" value={isNaN(sum.bust) ? "—" : Math.round(sum.bust) + "%"}
+                    sub="under the 25th" tone={UNDER_C} />
+                  <StatTile label="MEDIAN MISS" value={isNaN(sum.medErr) ? "—" : (sum.medErr > 0 ? "+" : "") + sum.medErr.toFixed(0)}
+                    sub="+ = projected too high" />
+                  <StatTile label="SET ASIDE" value={`${sum.flagged + sum.dnp}`}
+                    sub={`${sum.flagged} hurt/benched · ${sum.dnp} never played`} />
+                </div>
+              </div>
+              <div style={{ fontSize: 9.5, color: T.inkFaint, marginTop: 12, lineHeight: 1.5 }}>
+                A coin-flip model sits at 50%. Above that, the median is beatable on the over;
+                below it, these picks are priced wrong or the projection is too high.
+                Picks where the player saw under {Math.round(USAGE_FLOOR * 100)}% of his expected
+                workload are excluded — those say nothing about the matchup.
+              </div>
+            </Panel>
+
+            {/* where they landed */}
+            <Panel style={{ padding: "14px 16px", marginBottom: 12 }}>
+              <div style={{ fontSize: 10, color: T.inkFaint, letterSpacing: 1, marginBottom: 10 }}>
+                WHERE EACH PICK LANDED IN ITS RANGE
+              </div>
+              <ZoneBar zones={sum.zones} zoned={sum.zoned} />
+              <div style={{ fontSize: 9.5, color: T.inkFaint, marginTop: 8, lineHeight: 1.5 }}>
+                A calibrated projection puts about a quarter of results in each band. Weight to the
+                right means the numbers are too low and the overs are live; weight to the left means
+                the opposite.
+              </div>
+              <div style={{ height: 1, background: T.chalkFaint, margin: "14px 0" }} />
+              <LandingChart picks={picks} />
+            </Panel>
+
+            {/* by position */}
+            <Panel style={{ padding: "14px 16px", marginBottom: 12 }}>
+              <div style={{ fontSize: 10, color: T.inkFaint, letterSpacing: 1, marginBottom: 10 }}>
+                OVER RATE BY POSITION
+              </div>
+              <div style={{ display: "flex", gap: 26, flexWrap: "wrap" }}>
+                {byPos.map(([pos, v]) => (
+                  <StatTile key={pos} label={pos}
+                    value={isNaN(v.overRate) ? "—" : Math.round(v.overRate) + "%"}
+                    sub={`${v.overN}/${v.clean} clean`} tone={rateTone(v.overRate)} />
                 ))}
               </div>
+            </Panel>
 
-              <div style={{
-                marginTop: 12, paddingTop: 10, borderTop: `1px solid ${T.chalkFaint}`,
-              }}>
-                <div style={{ fontSize: 9, color: T.inkFaint, letterSpacing: 1, marginBottom: 7 }}>
-                  DOES A HIGH EDGE MEAN A BETTER RESULT?
+            {/* set-aside picks, so the exclusion is auditable */}
+            {flagged.length > 0 && (
+              <Panel style={{ padding: "14px 16px", marginBottom: 12 }}>
+                <div style={{ fontSize: 10, color: T.inkFaint, letterSpacing: 1, marginBottom: 9 }}>
+                  SET ASIDE — WORKLOAD COLLAPSED, NOT A FAIR TEST
                 </div>
-                <div style={{ display: "flex", gap: 22, flexWrap: "wrap" }}>
-                  {[["Top quartile", g.edge.topScore, g.edge.topBias, g.edge.topProd, g.edge.topBeat],
-                    ["Bottom quartile", g.edge.botScore, g.edge.botBias, g.edge.botProd, g.edge.botBeat]].map(
-                    ([lbl, sc, bias, prod, bt]) => (
-                    <div key={lbl} style={{ minWidth: 150 }}>
-                      <div style={{ fontSize: 9, color: T.inkFaint }}>{lbl} · EDGE {cell(sc, 0)}</div>
-                      <div style={{
-                        fontFamily: "'Barlow Condensed',sans-serif", fontSize: 20, fontWeight: 700,
-                        color: Math.abs(bias) < 6 ? T.gold : T.bad,
-                      }}>{bias > 0 ? "+" : ""}{cell(bias)} <span style={{ fontSize: 10, color: T.inkFaint }}>median miss</span></div>
-                      <div style={{ fontSize: 9, color: T.inkFaint }}>
-                        produced {cell(prod, 0)} avg · {cell(bt, 0, "%")} beat their projection
-                      </div>
-                    </div>
+                <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+                  {flagged.map((p) => (
+                    <Badge key={p.key} tone="cool" icon="⚠"
+                      label={`${p.name} — ${p.usageActual} of ~${Math.round(p.projUsage)} expected${p.injStatus ? ` · now ${p.injStatus}` : ""}`} />
                   ))}
                 </div>
-                <div style={{ fontSize: 9, color: T.inkFaint, marginTop: 8, lineHeight: 1.5 }}>
-                  Read the <strong>median miss</strong>: positive means the projection was too high for
-                  that group. A healthy board has both quartiles near zero — high-EDGE players should
-                  produce more in absolute terms (they do), without the projection overshooting them.
-                  Ratios like act/projection are not used here; they flatter small baselines and made
-                  the Week 1 ranking look inverted when the real problem was overshoot on elite players.
+                <div style={{ fontSize: 9.5, color: T.inkFaint, marginTop: 8, lineHeight: 1.5 }}>
+                  The feed carries no in-game participation flag, so workload is the signal: a back
+                  with three carries or a quarterback with eight attempts was hurt, benched, ejected
+                  or game-scripted out. Counting those would blame the matchup read for something else.
                 </div>
-              </div>
-            </div>
-          </Panel>
-        ))}
+              </Panel>
+            )}
 
-        {!busy && (
-          <button onClick={() => load(true)} style={{
-            padding: "7px 14px", fontSize: 11, fontWeight: 600, borderRadius: 3, cursor: "pointer",
-            background: "rgba(0,0,0,.3)", color: T.ink, border: `1px solid ${T.chalkDim}`, marginTop: 4,
-          }}>↻ Re-grade all weeks</button>
+            {showTable && (
+              <Panel style={{ padding: "12px 14px", marginBottom: 12, overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: 560 }}>
+                  <thead>
+                    <tr style={{ color: T.inkFaint, textAlign: "left" }}>
+                      {["Wk", "Player", "Pos", "Matchup", "EDGE", "Median", "Range", "Actual", "Result"].map((h) => (
+                        <th key={h} style={{ padding: "5px 7px", borderBottom: `1px solid ${T.chalkDim}`, fontWeight: 600 }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...picks].sort((a, b) => (b.score || 0) - (a.score || 0)).map((p) => (
+                      <tr key={p.key} style={{ borderBottom: `1px solid ${T.chalkFaint}` }}>
+                        <td style={{ padding: "5px 7px", color: T.inkFaint }}>{p.week}</td>
+                        <td style={{ padding: "5px 7px", color: T.ink }}>{p.name}</td>
+                        <td style={{ padding: "5px 7px", color: T.inkDim }}>{p.pos}</td>
+                        <td style={{ padding: "5px 7px", color: T.inkDim }}>{p.team} vs {p.opp}</td>
+                        <td style={{ padding: "5px 7px", color: T.inkDim }}>{p.score}</td>
+                        <td style={{ padding: "5px 7px", color: T.inkDim }}>{isFinite(p.median) ? p.median.toFixed(0) : "—"}</td>
+                        <td style={{ padding: "5px 7px", color: T.inkFaint }}>
+                          {isFinite(p.p25) ? `${p.p25.toFixed(0)}–${p.p75.toFixed(0)}` : "—"}
+                        </td>
+                        <td style={{ padding: "5px 7px", color: T.chalk }}>{p.played ? p.act.toFixed(0) : "DNP"}</td>
+                        <td style={{ padding: "5px 7px", fontWeight: 600, color: !p.played ? T.inkFaint : p.collapsed ? T.inkDim : p.over ? OVER_C : UNDER_C }}>
+                          {!p.played ? "—" : p.collapsed ? "set aside" : p.over ? "▲ over" : "▼ under"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </Panel>
+            )}
+
+            <Panel style={{ padding: "14px 16px", marginBottom: 16 }}>
+              <div style={{ fontSize: 10, color: T.inkFaint, letterSpacing: 1, marginBottom: 9 }}>
+                WHAT THIS SAYS FOR NEXT WEEK
+              </div>
+              <ul style={{ margin: 0, paddingLeft: 18, fontSize: 11.5, color: T.inkDim, lineHeight: 1.7 }}>
+                <li>
+                  {isNaN(sum.overRate) ? "Not enough clean picks yet to read an over rate."
+                    : sum.overRate >= 55 ? `Overs are landing at ${Math.round(sum.overRate)}% on this cohort — the projected medians are sitting low, so the over is the right side.`
+                    : sum.overRate <= 45 ? `Overs are landing at only ${Math.round(sum.overRate)}% — these medians are set too high for this cohort. Shade down or take unders.`
+                    : `At ${Math.round(sum.overRate)}% this cohort is a coin flip. No edge on the over from the ranking alone.`}
+                </li>
+                {!isNaN(sum.medErr) && Math.abs(sum.medErr) >= 5 && (
+                  <li>The median misses by {sum.medErr > 0 ? "+" : ""}{sum.medErr.toFixed(0)} yards
+                    {sum.medErr > 0 ? " on the high side — the number to bet is below what's shown." : " on the low side — there's room above the posted number."}</li>
+                )}
+                {byPos.length > 1 && (() => {
+                  const ranked = byPos.filter((x) => x[1].clean >= 3 && !isNaN(x[1].overRate))
+                    .sort((a, b) => b[1].overRate - a[1].overRate);
+                  if (ranked.length < 2) return null;
+                  const [best, worst] = [ranked[0], ranked[ranked.length - 1]];
+                  return <li><strong>{best[0]}</strong> is the strongest position at {Math.round(best[1].overRate)}% over,
+                    <strong> {worst[0]}</strong> the weakest at {Math.round(worst[1].overRate)}%. Weight parlays accordingly.</li>;
+                })()}
+                {sum.flagged > 0 && (
+                  <li>{sum.flagged} pick{sum.flagged > 1 ? "s" : ""} set aside for collapsed workload. If that
+                    keeps happening to the same kind of player, the injury report is worth reading before you bet.</li>
+                )}
+                {sum.dnp > 0 && (
+                  <li>{sum.dnp} never played at all — those are board bugs rather than bad reads, and worth chasing down.</li>
+                )}
+              </ul>
+            </Panel>
+          </>
         )}
       </div>
     </div>
@@ -1743,13 +2233,8 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
   const active = SCAN_TABS.find((t) => t.key === tab);
   const rows = useMemo(() => {
     let rs = includePlayed ? allRows : allRows.filter((r) => !r.started);
-    if (startersOnly) {
-      rs = rs.filter((r) => {
-        if (r.kind === "DEF" || r.depth == null) return true;  // unknown depth passes
-        const lim = DEPTH_LIMIT[r.pos];
-        return lim === undefined ? true : r.depth <= lim;
-      });
-    }
+    if (startersOnly) rs = rs.filter((r) => r.kind === "DEF" || r.depth == null
+      || DEPTH_LIMIT[r.pos] === undefined || r.depth <= DEPTH_LIMIT[r.pos]);
     return rs;
   }, [allRows, includePlayed, startersOnly]);
   const projOf = (r) => {
@@ -1896,7 +2381,7 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
 
 /* ------------------------------ game view ------------------------------ */
 
-function GameView({ game, league, tables, year, posMean, onBack }) {
+function GameView({ game, league, tables, year, posMean, env, onBack }) {
   const secRefs = {
     QB: useRef(null), REC: useRef(null), RB: useRef(null), DEF: useRef(null),
   };
@@ -2012,7 +2497,7 @@ function GameView({ game, league, tables, year, posMean, onBack }) {
         defAbbr: def.abbr, defRow, offRow, league: tables?.league, teams: tables?.teams || 32,
         wx, indoor, implied: impliedFor, log,
         oppHistory: log ? log.filter((g) => g.opp === def.abbr) : null,
-        posMean, crossSeason: league.season !== year,
+        posMean, crossSeason: league.season !== year, env, statSeason: league.season,
       };
       const a = analyze(p, kind, ctx);
       const head = a.headline;
@@ -2023,7 +2508,7 @@ function GameView({ game, league, tables, year, posMean, onBack }) {
       QB: build(groups.QB, "QB"), REC: build(groups.REC, "REC"),
       RB: build(groups.RB, "RB"), DEF: build(groups.DEF, "DEF"),
     };
-  }, [groups, logs, def.abbr, defRow, offRow, tables, wx, indoor, impliedFor, posMean, league.season, year]);
+  }, [groups, logs, def.abbr, defRow, offRow, tables, wx, indoor, impliedFor, posMean, env, league.season, year]);
 
   const jump = (k) => secRefs[k]?.current?.scrollIntoView({ behavior: "smooth", block: "start" });
 
@@ -2191,6 +2676,7 @@ function App() {
   const [view, setView] = useState("board");   // board | report
   const [league, setLeague] = useState(null);
   const [tables, setTables] = useState(null);
+  const [env, setEnv] = useState(null);
   const [dbProgress, setDbProgress] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -2215,7 +2701,17 @@ function App() {
       const statSeason = await resolveStatSeason(defaultYear);
       setLeague({ season: statSeason });
       const db = await buildSeasonDB(statSeason, setDbProgress);
-      if (db) setTables(leagueTables(db));
+      const t = db ? leagueTables(db) : null;
+      if (t) setTables(t);
+      /* When projecting off a prior season, measure how far this one has
+         drifted. Keyed by completed-game count so it refreshes each week. */
+      if (t && statSeason !== defaultYear) {
+        setDbProgress("Measuring this season's scoring environment…");
+        const liveDb = await buildSeasonDB(defaultYear, null, `live${new Date().toISOString().slice(0, 10)}`);
+        setEnv(leagueEnv(liveDb, t));
+      } else {
+        setEnv({ pass: 1, rush: 1, n: 0 });
+      }
       setDbProgress("");
     })();
   }, [defaultYear]);
@@ -2229,17 +2725,17 @@ function App() {
   }, [year, week, seasonType]);
 
   const doScan = useCallback(async (force) => {
-    if (!league || !tables || !week) return;
+    if (!league || !tables || !env || !week) return;
     const key = `${year}-${week}-${seasonType}-${league.season}`;
     if (!force && scanKey.current === key) return;
     scanKey.current = key;
     if (force) clearCache();
     setScanning(true); setScan(null);
     try {
-      setScan(await runScan({ year, week, seasonType, league, tables, onProgress: setProgress }));
+      setScan(await runScan({ year, week, seasonType, league, tables, env, onProgress: setProgress }));
     } catch (e) { setScan({ rows: [], error: e.message }); }
     setScanning(false);
-  }, [league, tables, week, year, seasonType]);
+  }, [league, tables, env, week, year, seasonType]);
 
   useEffect(() => { doScan(false); }, [doScan]);
 
@@ -2366,7 +2862,7 @@ function App() {
           )}
           {tables && selected && (
             <GameView key={selected.id} game={selected} league={league} tables={tables}
-              year={year} posMean={scan?.posMean} onBack={() => setSelected(null)} />
+              year={year} posMean={scan?.posMean} env={env} onBack={() => setSelected(null)} />
           )}
         </div>
       </div>
