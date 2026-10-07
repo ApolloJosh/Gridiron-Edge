@@ -38,7 +38,11 @@ expect this week**:
 
 Covered positions:
 
-- **QB** — yards/game, passer rating, YPA, completion %, TD%, INT%, TD/game, rush yards/game
+- **QB** — exactly one per team. The starter is resolved from the depth chart, filtered by this
+  game's injury report, and cross-checked against who's actually throwing the ball this season;
+  a promoted backup or an unclear QB situation is flagged on the card. Backup QBs are never
+  projected — unlike every other position, QB2 doesn't take snaps.
+- **QB stats** — yards/game, passer rating, YPA, completion %, TD%, INT%, TD/game, rush yards/game
 - **WR / TE** — yards/game, targets/game, receptions/game, YPR, TDs
 - **RB** — yards/game, carries/game, YPC, receptions/game, TDs
 - **Defenders** — tackles/game, sacks/game, INTs/game, passes defended, TFL, forced fumbles
@@ -49,8 +53,38 @@ divisional-game flag, bye teams, and a week selector for any week of any recent 
 
 ## How it's actually doing
 
-The tool grades itself. Every scan snapshots its projections; once the week is final the
-**Report Card** view scores them. First live week ([full write-up](docs/week1-2026.md)):
+The tool grades itself. Every scan snapshots its projections; once the week is final **The
+Over Board** scores them the way they're actually bet: of the picks you'd have taken, how many
+cleared their projected **median**, and where in the range they landed.
+
+- **Cohorts** — Top 3 / Top 5 per position, EDGE 75+, or everything. Top 3 is the default
+  because that's how the board gets played.
+- **Landing chart** — every pick plotted in band-widths from its own median, so players at
+  wildly different yardage scales sit on one axis.
+- **Injury screen** — a pick where the player saw under 50% of his expected workload is set
+  aside, not averaged in. A back with three carries was hurt, benched or game-scripted out; it
+  says nothing about the matchup. Those are listed so the exclusion is auditable.
+- **Table view** for the raw rows, and a plain-language read of what it means for next week.
+- **Week coverage** — if a week isn't on the board, the board says why in plain language rather
+  than omitting it: no snapshot was taken before kickoff, the week is still in progress (with
+  the game count), or grading errored. A week graded on a partial slate is labeled as such.
+
+**A week is only gradeable from projections captured before its games started.** Rebuilding a
+projection after the fact would feed the week's own results back into the numbers meant to
+predict them, so a missed week stays missed. To stop that happening by accident, scanning any
+week now also snapshots the **next** week in the background — so skipping a week no longer
+erases it.
+
+It has already caught and fixed a real defect.
+
+**Weeks 2–3** ([write-up](docs/weeks2-3-2026.md)) exposed a growing quarterback bias of −24
+then −36 yards (projecting too low), traced to three separate causes: shrinking starters
+toward a mean built half from backups, averaging relief appearances into starters' baselines,
+and ignoring that 2026 passing is up 3.8% on 2025. Fixing all three took Week 2 bias to **−0.3**
+and Week 3 to **−13.6**, with MAE improving in both weeks. Running backs and receivers were
+already within a few yards and were left alone.
+
+**First live week** ([full write-up](docs/week1-2026.md)):
 
 | Week 1 2026 (n=188) | Result |
 |---|---|
@@ -68,7 +102,10 @@ the opponent term still isn't paying for itself (weight cut 40% → 15%).
 
 Every constant in the model was chosen by backtest, not by intuition — 3,084 player-games,
 predicting each week from prior weeks only. Full write-up in [`docs/model.md`](docs/model.md),
-re-runnable harness in [`docs/backtest.js`](docs/backtest.js). The headlines:
+re-runnable harness in [`docs/backtest.js`](docs/backtest.js); the closing-line work lives in
+[`docs/lines.md`](docs/lines.md). New factors are now tested offline in a few seconds with
+[`docs/bench.js`](docs/bench.js) — no ESPN, no browser ([how it works](docs/bench.md)). The
+headlines:
 
 - **Opponent rushing defense barely predicts anything.** Full-strength opponent adjustment made
   RB projections *worse* (MAE 26.57 → 27.04). Optimal exponent ≈ 0.10, i.e. almost off.
@@ -77,6 +114,31 @@ re-runnable harness in [`docs/backtest.js`](docs/backtest.js). The headlines:
   (65.35 → 64.65), residual correlation 0.141. The asymmetry is measured, not assumed.
 - **Recency helps volume, hurts passing.** Carries blend 50/50 season+last-3 (4.30 → 4.20 MAE);
   last-3 passing yards is 7% *worse* than the season average.
+- **The closing line knows about points, not yards.** A team's implied total correlates
+  **+0.428** with the points it actually scores, identically in 2024 and 2025 — but at the
+  *player* level that collapses to nothing (residual corr −0.009 and +0.037 on ~2,950
+  observations a season). Only **running backs** survived both seasons: +0.068 / +0.084, each
+  season independently picking k≈0.6, worth 0.2 yards.
+- **A falling MAE is not evidence of signal.** Quarterbacks showed a replicated −0.11 residual
+  correlation and an MAE that improved — and the improvement was the *bias* column climbing
+  from −10.58 toward zero, the factor absorbing an underprojection that belongs elsewhere. The
+  test that separates them: does bias move **away** from zero while MAE falls? Running backs
+  pass it in both seasons and in opposite directions; quarterbacks fail it in both.
+- **Two traps found on the way.** The factor must be `implied ÷ this team's own prior mean`,
+  not `implied ÷ league mean`, because a player's baseline already encodes how good his offense
+  is — planted-effect tests recover a known exponent exactly under the first form and attenuate
+  it to 0.6 under the second. And `bestK` alone cannot tell a grid's floor from a real interior
+  minimum; read the whole curve. Full write-up in [lines.md](docs/lines.md).
+- **Volume is twice as predictable as yardage, and combination markets beat their components.**
+  Measured across every Fliff market ([markets.md](docs/markets.md)): passing attempts sit at CV
+  0.299 against receiving yards' 0.651. Rush + Rec Yards is meaningfully tighter than Rush Yards
+  alone, because the components cancel through game script instead of compounding. **Rushing
+  attempts** is the one market that is both quiet (CV 0.383) and genuinely predicted by a
+  player's own history (corr 0.454). Pass TD, Pass INT and FG Made are noise.
+- **Snap counts are a second copy of the box score.** Snap share showed the largest residual
+  correlation in the project (+0.30 for QBs) and did not survive two controls: against a
+  starts-only baseline the quarterback effect mostly vanished, and divided by plain usage trend
+  — carries, targets, attempts — nothing was left at any position. Free data, already known fact.
 - **The range beats the point estimate.** Median game-to-game variation is ~60% of a player's
   average — a back averaging 65 yards has a standard deviation near 39. But the 25–75 band from
   his game log held the actual result **47.7%** of the time against an ideal 50%.
@@ -100,7 +162,7 @@ and marks what is still pending. Adding a factor is one object in `buildFactors(
 | Carry volume recency | **active** | 50/50 season + last 3 games, applied to carries only |
 | Weather | **active** | Wind gusts and cold suppress passing, mildly help rushing; domes exempt |
 | Defensive-player volume | **active** | Opposing offense's actual plays per game vs league average |
-| Vegas implied team total | *context* | Real closing line from the scoreboard, shown but not multiplied in — ESPN retains no historical lines, so it can't be validated |
+| Vegas implied team total | *context — tested, RB only* | Measured at player level over two seasons. No blanket signal (residual corr −0.009 / +0.037). **Running backs** clear it: +0.068 / +0.084, both seasons picking k≈0.6, MAE better in both while bias moves *away* from zero — signal, not bias absorption. QB looked promising and failed that same test. Gain is 0.2 yards; not yet wired in. See [lines.md](docs/lines.md) |
 | Defense vs archetype | *pending* | Needs charting data ESPN doesn't expose publicly |
 
 **Archetypes are already classified** from production shape — Deep threat, Volume WR1,
@@ -111,7 +173,8 @@ a number, that factor renders as pending.
 
 ### EDGE score
 
-Still on every card: 0–100, 60% production grade + 40% opponent softness by rank.
+Still on every card: 0–100, **85% production grade + 15% opponent softness**. The opponent term
+was 40% until Week 1 2026 showed it wasn't earning it — see [docs/week1-2026.md](docs/week1-2026.md).
 
 | EDGE | Read |
 |---|---|
@@ -132,7 +195,7 @@ generator, then price it against your book's actual number.
 Open `index.html` in any browser. No build step, no install, no account, no API key.
 Requires an internet connection to pull live ESPN data. Works on phones.
 
-**Check the build stamp.** The header shows a version (e.g. `v4 · 2026-09-11`). If it doesn't
+**Check the build stamp.** The header shows a version (e.g. `v12 · 2026-10-07`). If it doesn't
 match the build you just updated to, you're looking at a cached or older copy — hard-reload
 (⌘⇧R), and if you're on GitHub Pages give it a minute to publish.
 
@@ -155,10 +218,16 @@ falls back automatically, and labels which season each stat came from.
 
 ## Roadmap
 
+- [ ] Run the closing-line factor at player level and ship or kill it ([lines.md](docs/lines.md))
+- [ ] Live wind from a real forecast source — nflverse's wind is recorded after kickoff, not predicted
+- [ ] Practice reports (DNP / Limited / Full) — the one signal that changes who is *on* the board
+- [x] ~~Snap counts~~ — tested and rejected: the signal is usage signal the box score already has ([bench.md](docs/bench.md))
 - [ ] Model the kickoff-window / game-script factor
 - [ ] Defense vs archetype (needs a charting data source — PFF, Sports Info Solutions)
 - [ ] True yards allowed by position (requires aggregating opponent box scores)
 - [ ] Line movement tracker (reverse line movement, key numbers at 3 / 7 / 10)
+- [x] ~~Project the quiet markets too~~ — v12: per-position market toggle, EDGE recomputed per market
+- [ ] Grade the alternate markets on the Over Board (it still snapshots yards only)
 - [ ] Player prop comparison vs the book's posted line
 - [ ] Depth chart ordering instead of production ordering for early-season slates
 

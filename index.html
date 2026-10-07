@@ -109,7 +109,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
  *  - teamrankings.com is NOT CORS-open; a browser page can never fetch it
  * ==================================================================== */
 
-const BUILD = "v11 · 2026-10-06";
+const BUILD = "v12 · 2026-10-07";
 
 const ESPN      = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_V2   = "https://site.api.espn.com/apis/v2/sports/football/nfl";
@@ -801,6 +801,145 @@ function shrinkBaseline(base, kind, ctx) {
   return pm + (base - pm) * k;
 }
 
+/* ======================= PROP MARKETS =======================
+ * The board can be pointed at any market, not just yards, because yards are
+ * the noisiest thing on the board. Measured across 2024-25 (docs/markets.md):
+ * passing attempts carry a coefficient of variation of 0.299 against receiving
+ * yards' 0.651, and every combination market is tighter than its own
+ * components — a quarterback who throws less runs more, so summing them
+ * cancels variance instead of adding it.
+ *
+ * `tiers` are percentiles of per-game averages among players who would
+ * actually have a line posted (p90 / p70 / p45 / p25), computed by
+ * docs/markets.js from real 2025 data. They are not chosen by eye, and they
+ * drive both the grade shown and the EDGE for that market.
+ *
+ * `opp` says whether the opponent multiplier applies. It is OFF for volume
+ * markets: that term is a yards-allowed ratio, already measured near-zero for
+ * yards (docs/model.md), and applied to a carry count it means nothing at all.
+ * ============================================================ */
+const MARKETS = {
+  QB: [
+    { id: "passYds", label: "Pass Yds", keys: ["passingYards"], d: 1, opp: true, starts: true,
+      tiers: { "*": [256, 231, 201, 176] } },
+    { id: "passAtt", label: "Pass Att", keys: ["passingAttempts"], d: 1, opp: false, starts: true,
+      tiers: { "*": [34.6, 31.8, 28.9, 26.5] } },
+    { id: "passCmp", label: "Completions", keys: ["completions"], d: 1, opp: false, starts: true,
+      tiers: { "*": [22.5, 20.1, 19.0, 16.3] } },
+    { id: "passRushYds", label: "Pass+Rush Yds", keys: ["passingYards", "rushingYards"], d: 1, opp: true, starts: true,
+      tiers: { "*": [271, 251, 220, 196] } },
+  ],
+  RB: [
+    { id: "rushYds", label: "Rush Yds", keys: ["rushingYards"], d: 1, opp: true,
+      tiers: { "*": [84.4, 65.1, 53.6, 43.9] } },
+    { id: "rushAtt", label: "Carries", keys: ["rushingAttempts"], d: 1, opp: false, recency: true,
+      tiers: { "*": [17.5, 15.2, 12.6, 9.9] } },
+    { id: "rushRecYds", label: "Rush+Rec Yds", keys: ["rushingYards", "receivingYards"], d: 1, opp: true,
+      tiers: { "*": [112.5, 83.6, 71.3, 54.6] } },
+    { id: "rbRec", label: "Receptions", keys: ["receptions"], d: 1, opp: false,
+      tiers: { "*": [4.1, 2.4, 2.1, 1.2] } },
+  ],
+  REC: [
+    { id: "recYds", label: "Rec Yds", keys: ["receivingYards"], d: 1, opp: true,
+      tiers: { WR: [74.5, 59.2, 45.7, 38.2], TE: [57.1, 48.1, 39.4, 30.5] } },
+    { id: "rec", label: "Receptions", keys: ["receptions"], d: 1, opp: false,
+      tiers: { WR: [5.8, 4.5, 3.7, 3.0], TE: [5.2, 4.5, 3.6, 3.3] } },
+    { id: "tgt", label: "Targets", keys: ["receivingTargets"], d: 1, opp: false,
+      tiers: { "*": [8.5, 6.5, 4.5, 3] } },
+  ],
+};
+
+/* The board shows one position at a time, so the market picker is per position.
+   The first entry of each list is that position's default — the yards market
+   the board has always shown. */
+const TAB_KIND = { QB: "QB", RB: "RB", WR: "REC", TE: "REC", DEF: "DEF" };
+const defaultMarket = (kind) => (MARKETS[kind] || [])[0]?.id || null;
+
+/**
+ * What to show for one player under the selected market.
+ *
+ * The default yards market deliberately keeps the COMPOSITE EDGE the board was
+ * validated on — a blend of yards, rating, efficiency and volume grades. Any
+ * other market scores on that market alone, against its own measured tiers,
+ * because "how good is he at receptions" is a different question from "how good
+ * is he". The card says which one it is showing.
+ */
+function marketView(a, id) {
+  if (!a) return null;
+  const h = a.headline;
+  const base = {
+    id: null, label: h?.label || "", d: h?.d ?? 1,
+    proj: h ? a.projected[h.key] : NaN, band: a.band, score: a.score,
+    isDefault: true, avail: true,
+  };
+  if (a.kind === "DEF" || !a.markets || !id) return base;
+  const m = a.markets[id];
+  if (!m || !m.avail) return { ...base, avail: false, wanted: id, wantedLabel: m?.label || id };
+  if (id === defaultMarket(a.kind)) return { ...base, id, label: m.label, d: m.d, market: m };
+  return {
+    id, label: m.label, d: m.d, proj: m.proj, band: m.band, score: m.score,
+    isDefault: false, avail: true, market: m,
+  };
+}
+
+/** Per-game values for one market, or [] if the log doesn't carry its fields. */
+function marketSeries(log, m, filter) {
+  if (!log) return [];
+  const src = filter ? log.filter(filter) : log;
+  const out = [];
+  src.forEach((g) => {
+    const vals = m.keys.map((k) => g.stats[k]);
+    if (vals.every((v) => v !== undefined && !isNaN(v))) out.push(vals.reduce((a, b) => a + b, 0));
+  });
+  return out;
+}
+
+/**
+ * Every market for one player, computed once at analyze time.
+ *
+ * A market whose fields are missing from ESPN's game log comes back
+ * `avail: false` rather than silently projecting zero — the board then greys
+ * that option out instead of showing a confident wrong number.
+ */
+function buildMarkets(kind, pos, ctx, { log, passMult, rushMult, softness, isRush }) {
+  const defs = MARKETS[kind];
+  if (!defs) return null;
+  const startFilter = (g) => num(g.stats.passingAttempts) >= QB_START_ATT;
+  const hasStarts = log && log.filter(startFilter).length >= 3;
+  const out = {};
+  defs.forEach((m) => {
+    const series = marketSeries(log, m, m.starts && hasStarts ? startFilter : null);
+    if (series.length < 3) { out[m.id] = { ...m, avail: false }; return; }
+    const tiers = m.tiers[pos] || m.tiers["*"] || null;
+    const seasonAvg = mean(series);
+    let base = seasonAvg;
+    /* carries blend to recency — 50/50 beat season alone, 4.197 vs 4.305 */
+    if (m.recency && series.length >= 3) {
+      base = CARRY_RECENCY * mean(series.slice(-3)) + (1 - CARRY_RECENCY) * seasonAvg;
+    }
+    /* shrink toward the measured p45 for this market, the same way yardage
+       baselines shrink toward a positional mean */
+    if (tiers) {
+      const table = ctx?.crossSeason ? SHRINK_CROSS : SHRINK;
+      const k = table[kind] !== undefined ? table[kind] : 1;
+      base = tiers[2] + (base - tiers[2]) * k;
+    }
+    const e = (isRush ? ctx.env?.rush : ctx.env?.pass) || 1;
+    const mult = (m.opp ? (isRush ? rushMult : passMult) : 1) * e;
+    const dist = distribution(series);
+    const g = tiers ? grade(seasonAvg, tiers) : null;
+    const ps = g ? GRADE_SCORE[g] : null;
+    out[m.id] = {
+      ...m, avail: true, tiers, n: series.length, seasonAvg, mult,
+      proj: base * mult,
+      band: dist ? { ...dist, p25adj: dist.p25 * mult, p75adj: dist.p75 * mult, medianAdj: dist.median * mult } : null,
+      grade: g,
+      score: ps === null ? null : Math.round((ps * EDGE_W_PLAYER + softness * EDGE_W_OPP) * 100),
+    };
+  });
+  return out;
+}
+
 /** Distribution from the game log — the part the backtest said to trust. */
 function distribution(values) {
   const v = values.filter((x) => !isNaN(x));
@@ -1019,16 +1158,21 @@ function analyze(p, kind, ctx) {
   const softness = defRank ? (defRank - 1) / Math.max(1, (ctx.teams || 32) - 1) : 0.5;
   const score = playerScore === null ? null : Math.round((playerScore * EDGE_W_PLAYER + softness * EDGE_W_OPP) * 100);
 
+  const markets = kind === "DEF" ? null
+    : buildMarkets(kind, p.pos, ctx, {
+        log, passMult, rushMult, softness, isRush: phase === "rush",
+      });
+
   return {
     kind, phase, archetype, factors, projected, seasonCells, projLabels, grades,
     score, verdict: edgeVerdict(score), gamesPlayed: G, volume, dist, band, headline,
-    oppHistory: ctx.oppHistory || null, log,
+    oppHistory: ctx.oppHistory || null, log, markets,
     baselineAtt: typeof baselineAtt === "number" ? baselineAtt : null,
   };
 }
 
 function edgeVerdict(score) {
-  if (score === null) return { label: "No data", tone: "neutral" };
+  if (score === null || score === undefined || isNaN(score)) return { label: "No data", tone: "neutral" };
   if (score >= 72) return { label: "Smash spot", tone: "hot" };
   if (score >= 58) return { label: "Lean", tone: "warm" };
   if (score >= 42) return { label: "Neutral", tone: "neutral" };
@@ -2109,6 +2253,12 @@ function PlayerCard({ p, kind, ctx }) {
   const a = useMemo(() => analyze(p, kind, ctx), [p, kind, ctx]);
   const hasAny = a.seasonCells.some((c) => c.value !== "—");
   const head = a.headline;
+  const marketDefs = MARKETS[kind] || [];
+  const [marketId, setMarketId] = useState(defaultMarket(kind));
+  const v = marketView(a, marketId) || {};
+  const vv = edgeVerdict(v.score);
+  /* the single market the card is showing, when it isn't the default */
+  const mk = v.isDefault ? null : v.market;
 
   return (
     <Panel style={{ marginBottom: 10, overflow: "hidden" }}>
@@ -2128,9 +2278,9 @@ function PlayerCard({ p, kind, ctx }) {
         <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{
             fontFamily: "'Barlow Condensed',sans-serif", fontSize: 25, fontWeight: 700,
-            color: TONES[a.verdict.tone].fg, lineHeight: 1,
-          }}>{a.score === null ? "—" : a.score}</span>
-          <Badge label={a.verdict.label} tone={a.verdict.tone} />
+            color: TONES[vv.tone].fg, lineHeight: 1,
+          }}>{v.score === null || v.score === undefined ? "—" : v.score}</span>
+          <Badge label={vv.label} tone={vv.tone} />
         </span>
       </div>
       <ChalkLine />
@@ -2161,13 +2311,57 @@ function PlayerCard({ p, kind, ctx }) {
               EXPECTED RANGE vs {ctx.defAbbr}
             </div>
 
-            {a.band
-              ? <RangeBar band={a.band} label={head?.label || ""} />
+            {marketDefs.length > 1 && (
+              <div className="gx-tabs" style={{
+                display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center", margin: "8px 0 2px",
+              }}>
+                {marketDefs.map((m) => {
+                  const on = marketId === m.id;
+                  const miss = a.markets && a.markets[m.id] && a.markets[m.id].avail === false;
+                  return (
+                    <button key={m.id} disabled={miss} onClick={() => setMarketId(m.id)} title={miss
+                      ? "ESPN's game log doesn't carry this stat for him" : ""} style={{
+                      padding: "4px 10px", fontSize: 10.5, fontWeight: 700, borderRadius: 3,
+                      cursor: miss ? "not-allowed" : "pointer", opacity: miss ? .4 : 1,
+                      background: on ? T.gold : "rgba(0,0,0,.3)",
+                      color: on ? T.leatherDark : "#e8c9ac",
+                      border: `1px solid ${on ? T.gold : "rgba(232,201,172,.35)"}`,
+                      fontFamily: "'Barlow Condensed',sans-serif", letterSpacing: .6, minHeight: 28,
+                    }}>{m.label}</button>
+                  );
+                })}
+                <span style={{ fontSize: 9, color: "#c9a583", marginLeft: 3 }}>
+                  {v.isDefault ? "EDGE = overall production grade"
+                    : `EDGE = ${v.label} graded against league tiers`}
+                </span>
+              </div>
+            )}
+
+            {v.avail === false && (
+              <div style={{ fontSize: 10.5, color: UNDER_C, marginTop: 6 }}>
+                No {v.wantedLabel} in his game log — showing {head?.label || "yards"} instead.
+              </div>
+            )}
+
+            {v.band
+              ? <RangeBar band={v.band} label={v.label || ""} />
               : <div style={{ fontSize: 11, color: "#c9a583", marginTop: 6 }}>
                   Game log unavailable — point estimate only.
                 </div>}
 
             <div className="gx-statgrid" style={{ display: "flex", gap: 22, flexWrap: "wrap", marginTop: 12 }}>
+              {mk && (
+                <div style={{ minWidth: 74 }}>
+                  <div style={{ fontSize: 9, color: T.gold, letterSpacing: .5 }}>{mk.label.toUpperCase()}</div>
+                  <div style={{
+                    fontFamily: "'Barlow Condensed',sans-serif", fontSize: 21, fontWeight: 700,
+                    color: T.chalk, lineHeight: 1.1,
+                  }}>{isFinite(mk.proj) ? mk.proj.toFixed(mk.d) : "—"}</div>
+                  <div style={{ fontSize: 9, color: T.inkFaint }}>
+                    point estimate · {mk.n}g avg {mk.seasonAvg.toFixed(mk.d)}
+                  </div>
+                </div>
+              )}
               {a.projLabels.map((l) => (
                 <div key={l.key} style={{ minWidth: 74 }}>
                   <div style={{ fontSize: 9, color: "#e8c9ac", letterSpacing: .5 }}>{l.label}</div>
@@ -2181,9 +2375,11 @@ function PlayerCard({ p, kind, ctx }) {
             </div>
 
             <FactorChain factors={a.factors} />
-            {a.log && head?.logKey && (
+            {a.log && (mk && mk.keys.length === 1 ? (
+              <GameLogStrip log={a.log} statKey={mk.keys[0]} label={mk.label} opp={ctx.defAbbr} />
+            ) : head?.logKey ? (
               <GameLogStrip log={a.log} statKey={head.logKey} label={head.label} opp={ctx.defAbbr} />
-            )}
+            ) : null)}
             {a.oppHistory?.length > 0 && head?.logKey && (
               <div style={{ fontSize: 10, color: "#e8c9ac", marginTop: 8 }}>
                 vs {ctx.defAbbr} previously: {a.oppHistory.map((g) =>
@@ -2191,7 +2387,14 @@ function PlayerCard({ p, kind, ctx }) {
                 <span style={{ color: T.inkFaint }}> (1–2 games — anecdote, not signal)</span>
               </div>
             )}
-            {a.band && <HitRate band={a.band} label={head?.label || "line"} />}
+            {v.band && <HitRate band={v.band} label={v.label || "line"} />}
+            {mk && !mk.opp && (
+              <div style={{ fontSize: 9.5, color: "#c9a583", marginTop: 7, lineHeight: 1.5 }}>
+                No opponent adjustment on this market — the opponent term is a yards-allowed
+                ratio, measured near-zero even for yards, and meaningless against a count.
+                Weather and the league environment still apply.
+              </div>
+            )}
           </div>
         </>
       )}
@@ -2254,10 +2457,13 @@ const SCAN_TABS = [
   { key: "DEF", label: "DEF", match: (r) => r.kind === "DEF" },
 ];
 
-function ScanRow({ rank, row, onOpen }) {
+function ScanRow({ rank, row, onOpen, marketId }) {
   const a = row.analysis;
-  const head = a.headline;
-  const point = head && !isNaN(a.projected[head.key]) ? a.projected[head.key].toFixed(head.d) : "—";
+  const v = marketView(a, marketId) || {};
+  const point = isFinite(v.proj) ? v.proj.toFixed(v.d ?? 1) : "—";
+  const band = v.band;
+  /* a band wider than one decimal place would read as "4–4" on receptions */
+  const bd = (v.d ?? 1) > 0 && band && (band.p75adj - band.p25adj) < 4 ? 1 : 0;
   const defFactor = a.factors.find((f) => f.key === "def" || f.key === "pace");
   return (
     <div className="scan-row" onClick={() => onOpen(row.game)} style={{
@@ -2290,18 +2496,21 @@ function ScanRow({ rank, row, onOpen }) {
         </div>
       </div>
       <div className="gx-row-proj" style={{ textAlign: "right", minWidth: 96 }}>
-        <div style={{ fontSize: 9, color: "#e8c9ac", letterSpacing: .5 }}>{head?.label || "PROJ"}</div>
+        <div style={{ fontSize: 9, color: "#e8c9ac", letterSpacing: .5 }}>
+          {(v.label || "PROJ").toUpperCase()}
+          {v.avail === false && <span style={{ color: UNDER_C }}> ✕</span>}
+        </div>
         <div style={{
           fontFamily: "'Barlow Condensed',sans-serif", fontSize: 21, fontWeight: 700, color: T.gold,
-        }}>{a.band ? `${a.band.p25adj.toFixed(0)}–${a.band.p75adj.toFixed(0)}` : point}</div>
-        {a.band && <div style={{ fontSize: 9, color: T.inkFaint }}>mid 50% · pt {point}</div>}
+        }}>{band ? `${band.p25adj.toFixed(bd)}–${band.p75adj.toFixed(bd)}` : point}</div>
+        {band && <div style={{ fontSize: 9, color: T.inkFaint }}>mid 50% · pt {point}</div>}
       </div>
       <div className="gx-row-score" style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 130, justifyContent: "flex-end" }}>
         <span style={{
           fontFamily: "'Barlow Condensed',sans-serif", fontSize: 25, fontWeight: 700,
-          color: TONES[a.verdict.tone].fg, lineHeight: 1,
-        }}>{a.score}</span>
-        <Badge label={a.verdict.label} tone={a.verdict.tone} />
+          color: TONES[edgeVerdict(v.score).tone].fg, lineHeight: 1,
+        }}>{v.score ?? "—"}</span>
+        <Badge label={edgeVerdict(v.score).label} tone={edgeVerdict(v.score).tone} />
       </div>
     </div>
   );
@@ -2312,24 +2521,31 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
   const [includePlayed, setIncludePlayed] = useState(false);
   const [startersOnly, setStartersOnly] = useState(true);
   const [sortBy, setSortBy] = useState("proj");   // proj | edge
+  /* market choice is remembered per position, so flipping QB to Pass Att
+     doesn't silently change what RB is showing */
+  const [market, setMarket] = useState({});
   const allRows = scan?.rows || [];
   const active = SCAN_TABS.find((t) => t.key === tab);
+  const kind = TAB_KIND[tab];
+  const marketDefs = MARKETS[kind] || [];
+  const marketId = market[kind] || defaultMarket(kind);
   const rows = useMemo(() => {
     let rs = includePlayed ? allRows : allRows.filter((r) => !r.started);
     if (startersOnly) rs = rs.filter((r) => r.kind === "DEF" || r.depth == null
       || DEPTH_LIMIT[r.pos] === undefined || r.depth <= DEPTH_LIMIT[r.pos]);
     return rs;
   }, [allRows, includePlayed, startersOnly]);
-  const projOf = (r) => {
-    const h = r.analysis?.headline;
-    const v = h ? r.analysis.projected[h.key] : NaN;
-    return isFinite(v) ? v : -1;
-  };
+  const viewOf = (r) => marketView(r.analysis, marketId);
+  const projOf = (r) => { const v = viewOf(r)?.proj; return isFinite(v) ? v : -1; };
+  const scoreOf = (r) => { const v = viewOf(r)?.score; return isFinite(v) ? v : -1; };
   const top = useMemo(() => {
     const list = rows.filter(active.match);
-    list.sort(sortBy === "proj" ? (a, b) => projOf(b) - projOf(a) : (a, b) => b.score - a.score);
+    list.sort(sortBy === "proj" ? (a, b) => projOf(b) - projOf(a) : (a, b) => scoreOf(b) - scoreOf(a));
     return list.slice(0, 10);
-  }, [rows, tab, sortBy]);
+  }, [rows, tab, sortBy, marketId]);
+  /* how many of the shown players actually have this market in their log */
+  const marketMissing = useMemo(
+    () => top.filter((r) => viewOf(r)?.avail === false).length, [top, marketId]);
   const counts = useMemo(() => {
     const c = {};
     SCAN_TABS.forEach((t) => { c[t.key] = rows.filter(t.match).length; });
@@ -2381,7 +2597,7 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
         ))}
         <div style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 4 }}>
           <span style={{ fontSize: 9, color: T.inkFaint, letterSpacing: .8, marginRight: 2 }}>SORT</span>
-          {[["proj", "Proj yds"], ["edge", "EDGE"]].map(([k, lbl]) => (
+          {[["proj", "Proj"], ["edge", "EDGE"]].map(([k, lbl]) => (
             <button key={k} onClick={() => setSortBy(k)} style={{
               padding: "5px 10px", fontSize: 11, fontWeight: 600, borderRadius: 3, cursor: "pointer",
               background: sortBy === k ? "rgba(255,199,44,.18)" : "rgba(0,0,0,.3)",
@@ -2415,6 +2631,32 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
         }}>{scanning ? "Scanning…" : "↻ Rescan"}</button>
       </div>
 
+      {marketDefs.length > 1 && (
+        <div className="gx-tabs" style={{
+          display: "flex", gap: 6, marginBottom: 14, flexShrink: 0, flexWrap: "wrap",
+          alignItems: "center",
+        }}>
+          <span style={{ fontSize: 9, color: T.inkFaint, letterSpacing: 1, marginRight: 2 }}>MARKET</span>
+          {marketDefs.map((m) => (
+            <button key={m.id} onClick={() => setMarket((p) => ({ ...p, [kind]: m.id }))} style={{
+              padding: "6px 12px", fontSize: 11.5, fontWeight: 700, borderRadius: 3, cursor: "pointer",
+              background: marketId === m.id ? "rgba(255,199,44,.18)" : "rgba(0,0,0,.3)",
+              color: marketId === m.id ? T.gold : T.inkDim,
+              border: `1px solid ${marketId === m.id ? T.gold : T.chalkDim}`,
+              fontFamily: "'Barlow Condensed',sans-serif", letterSpacing: .8, minHeight: 32,
+            }}>{m.label}</button>
+          ))}
+          <span style={{ fontSize: 9.5, color: T.inkFaint, marginLeft: 4, lineHeight: 1.4 }}>
+            {marketId === defaultMarket(kind)
+              ? "EDGE grades overall production"
+              : "EDGE grades this market alone"}
+            {marketMissing > 0 && (
+              <span style={{ color: UNDER_C }}> · {marketMissing} player{marketMissing > 1 ? "s" : ""} missing this stat, shown on yards</span>
+            )}
+          </span>
+        </div>
+      )}
+
       <div style={{ flex: 1, overflowY: "auto", paddingRight: 5 }}>
         {scanning && (
           <Panel style={{ padding: "30px 20px", textAlign: "center" }}>
@@ -2440,9 +2682,13 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
               display: "flex", alignItems: "center", gap: 8, padding: "8px 12px",
               background: "rgba(0,0,0,.25)", fontSize: 9, letterSpacing: 1.3,
               color: T.inkFaint, fontWeight: 600,
-            }}>TOP 10 {active.label} BY {sortBy === "proj" ? "PROJECTED YARDS" : "EDGE"} · RANGE IS THE MIDDLE 50% OF HIS GAMES · CLICK FOR THE FULL MATCHUP</div>
+            }}>TOP 10 {active.label} BY {sortBy === "proj"
+              ? `PROJECTED ${(marketDefs.find((m) => m.id === marketId)?.label || "YARDS").toUpperCase()}`
+              : "EDGE"} · RANGE IS THE MIDDLE 50% OF HIS GAMES · CLICK FOR THE FULL MATCHUP</div>
             <ChalkLine />
-            {top.map((row, i) => <ScanRow key={row.player.id} rank={i + 1} row={row} onOpen={onOpen} />)}
+            {top.map((row, i) => (
+              <ScanRow key={row.player.id} rank={i + 1} row={row} onOpen={onOpen} marketId={marketId} />
+            ))}
           </Panel>
         )}
         {!scanning && scan?.byes?.length > 0 && (
