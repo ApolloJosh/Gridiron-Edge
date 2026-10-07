@@ -65,6 +65,9 @@ cleared their projected **median**, and where in the range they landed.
   aside, not averaged in. A back with three carries was hurt, benched or game-scripted out; it
   says nothing about the matchup. Those are listed so the exclusion is auditable.
 - **Table view** for the raw rows, and a plain-language read of what it means for next week.
+- **Market picker** — score carries, receptions or a combination market instead of yards. Each
+  scan snapshots every market with its own band and EDGE, so any of them can be graded after
+  the fact.
 - **Week coverage** — if a week isn't on the board, the board says why in plain language rather
   than omitting it: no snapshot was taken before kickoff, the week is still in progress (with
   the game count), or grading errored. A week graded on a partial slate is labeled as such.
@@ -227,7 +230,7 @@ falls back automatically, and labels which season each stat came from.
 - [ ] True yards allowed by position (requires aggregating opponent box scores)
 - [ ] Line movement tracker (reverse line movement, key numbers at 3 / 7 / 10)
 - [x] ~~Project the quiet markets too~~ — v12: per-position market toggle, EDGE recomputed per market
-- [ ] Grade the alternate markets on the Over Board (it still snapshots yards only)
+- [x] ~~Grade the alternate markets on the Over Board~~ — v12
 - [ ] Player prop comparison vs the book's posted line
 - [ ] Depth chart ordering instead of production ordering for early-season slates
 

@@ -1376,6 +1376,22 @@ const boardVisible = (r) => {
   return lim === undefined ? true : r.depth <= lim;
 };
 
+/** Each available market for one row, flattened for storage. */
+function snapMarkets(r) {
+  const ms = r.analysis?.markets;
+  if (!ms) return null;
+  const out = {};
+  Object.values(ms).forEach((m) => {
+    if (!m.avail || !isFinite(m.proj)) return;
+    out[m.id] = {
+      label: m.label, keys: m.keys, d: m.d, proj: m.proj,
+      median: m.band?.medianAdj, p25: m.band?.p25adj, p75: m.band?.p75adj,
+      score: m.score,
+    };
+  });
+  return Object.keys(out).length ? out : null;
+}
+
 function saveProjections(year, week, rows) {
   const snap = rows
     .filter(boardVisible)
@@ -1393,6 +1409,9 @@ function saveProjections(year, week, rows) {
          play a normal game" before it is allowed to score the model. */
       usageStat: USAGE_STAT[r.kind] || null,
       projUsage: USAGE_PROJ[r.kind] ? USAGE_PROJ[r.kind](r.analysis) : null,
+      /* Every market, not just the headline one. The fields above are kept
+         as-is so snapshots taken before v12 keep grading the way they did. */
+      markets: snapMarkets(r),
     }))
     .filter((x) => isFinite(x.proj));
   if (snap.length) store.set(`gx_proj_${year}_${week}`, { year, week, savedAt: Date.now(), rows: snap });
@@ -1413,7 +1432,9 @@ async function weekActuals(games) {
           keys.forEach((k, i) => { vals[k] = a.stats?.[i]; });
           if (cat.name === "passing") {
             rec.passingYards = num(vals.passingYards);
+            /* the box score ships these as one "12/19" field, not two */
             const ca = String(vals["completions/passingAttempts"] || "0/0").split("/");
+            rec.completions = num(ca[0]);
             rec.passingAttempts = num(ca[1]);
           }
           if (cat.name === "rushing") {
@@ -1423,6 +1444,7 @@ async function weekActuals(games) {
           if (cat.name === "receiving") {
             rec.receivingYards = num(vals.receivingYards);
             rec.receivingTargets = num(vals.receivingTargets);
+            rec.receptions = num(vals.receptions);
           }
         });
       });
@@ -1453,7 +1475,7 @@ async function weekActuals(games) {
  * away. Those are separated out rather than silently averaged in.
  */
 async function gradeWeek(year, week, force) {
-  const gk = `gx_grade_${year}_${week}_v11`;
+  const gk = `gx_grade_${year}_${week}_v12`;
   if (!force) { const c = store.get(gk); if (c) return c; }
   const snap = store.get(`gx_proj_${year}_${week}`);
   if (!snap?.rows?.length) return { week, year, reason: "nosnap" };
@@ -1472,33 +1494,62 @@ async function gradeWeek(year, week, force) {
   if (!gradable.length) return { week, year, reason: "notfinal", gamesTotal: games.length, gamesFinal: final.length };
 
   const actual = await weekActuals(final);
-  const picks = gradable.map((r) => {
-    const a = actual[r.id] || null;
-    const act = a ? a[r.stat] : undefined;
+
+  /* Score one projected line against what the player actually did. Shared by
+     the legacy headline fields and by every market, so a market's result is
+     computed exactly the way the yards result always was. */
+  const scoreLine = (spec, a) => {
+    const keys = spec.keys || [spec.stat];
+    const vals = keys.map((k) => (a ? a[k] : undefined));
+    const act = vals.every((v) => v !== undefined && !isNaN(v))
+      ? vals.reduce((x, y) => x + y, 0) : undefined;
     const played = act !== undefined && !isNaN(act);
     /* Older snapshots predate the median; fall back to the point estimate. */
-    const median = isFinite(r.median) ? r.median : r.proj;
+    const median = isFinite(spec.median) ? spec.median : spec.proj;
+    const band = isFinite(spec.p25) && isFinite(spec.p75) && spec.p75 > spec.p25;
+    let zone = null, bandWidths = null;
+    if (played && band) {
+      zone = act > spec.p75 ? "above" : act >= median ? "upper" : act >= spec.p25 ? "lower" : "below";
+      bandWidths = (act - median) / (spec.p75 - spec.p25);
+    }
+    return { act: played ? act : null, played, median, zone, bandWidths,
+      over: played ? act > median : null };
+  };
+
+  const picks = gradable.map((r) => {
+    const a = actual[r.id] || null;
+    const headline = scoreLine(r, a);
     const usageActual = a && r.usageStat ? a[r.usageStat] : undefined;
     const usageRatio = (isFinite(r.projUsage) && r.projUsage > 0 && isFinite(usageActual))
       ? usageActual / r.projUsage : null;
     const collapsed = usageRatio !== null && usageRatio < USAGE_FLOOR;
-    const band = isFinite(r.p25) && isFinite(r.p75) && r.p75 > r.p25;
-    let zone = null, bandWidths = null;
-    if (played && band) {
-      zone = act > r.p75 ? "above" : act >= median ? "upper" : act >= r.p25 ? "lower" : "below";
-      bandWidths = (act - median) / (r.p75 - r.p25);
-    }
+
+    /* Every market this player was snapshotted with. Snapshots taken before
+       v12 have none, and grade on the headline alone exactly as before. */
+    const byMarket = {};
+    Object.entries(r.markets || {}).forEach(([id, m]) => {
+      byMarket[id] = { ...m, ...scoreLine(m, a), collapsed };
+    });
+
     return {
-      ...r, median, act: played ? act : null, played,
-      over: played ? act > median : null,
-      zone, bandWidths, usageActual: isFinite(usageActual) ? usageActual : null,
+      ...r, ...headline, byMarket,
+      usageActual: isFinite(usageActual) ? usageActual : null,
       usageRatio, collapsed, injStatus: a?.injStatus || null,
     };
   });
 
   const complete = final.length === games.length;
   const result = {
-    year, week, gradedAt: Date.now(), version: 11,
+    year, week, gradedAt: Date.now(), version: 12,
+    /* which markets this week actually carries, for the Over Board's picker */
+    markets: (() => {
+      const seen = {};
+      picks.forEach((p) => Object.entries(p.byMarket || {}).forEach(([id, m]) => {
+        seen[id] = seen[id] || { id, label: m.label, n: 0 };
+        if (m.played) seen[id].n++;
+      }));
+      return seen;
+    })(),
     projected: picks.length,
     played: picks.filter((p) => p.played).length,
     dnp: picks.filter((p) => !p.played).length,
@@ -1775,6 +1826,9 @@ function ReportCard({ year, currentWeek }) {
   const [weekSel, setWeekSel] = useState("all");
   const [showTable, setShowTable] = useState(false);
   const [gaps, setGaps] = useState([]);
+  /* "headline" is the yards market every week has always been graded on;
+     anything else scores that market and drops picks that don't carry it. */
+  const [mktSel, setMktSel] = useState("headline");
 
   const load = useCallback(async (force) => {
     setBusy(true); setMsg("");
@@ -1797,10 +1851,24 @@ function ReportCard({ year, currentWeek }) {
   }, [year, currentWeek]);
   useEffect(() => { load(false); }, [load]);
 
+  const mktOpts = useMemo(() => {
+    const seen = {};
+    grades.forEach((g) => Object.values(g.markets || {}).forEach((m) => {
+      seen[m.id] = seen[m.id] || { id: m.id, label: m.label, n: 0 };
+      seen[m.id].n += m.n || 0;
+    }));
+    return Object.values(seen).filter((m) => m.n > 0).sort((a, b) => b.n - a.n);
+  }, [grades]);
+
   const allPicks = useMemo(() => {
     const src = weekSel === "all" ? grades : grades.filter((g) => g.week === +weekSel);
-    return src.flatMap((g) => g.picks.map((p, i) => ({ ...p, week: g.week, key: `${g.week}-${p.id}-${i}` })));
-  }, [grades, weekSel]);
+    const flat = src.flatMap((g) => g.picks.map((p, i) => ({ ...p, week: g.week, key: `${g.week}-${p.id}-${i}` })));
+    if (mktSel === "headline") return flat;
+    /* hoist the selected market's result to the top level, so every summary,
+       chart and table below reads it the same way it reads the yards one */
+    return flat.map((p) => (p.byMarket && p.byMarket[mktSel]
+      ? { ...p, ...p.byMarket[mktSel] } : null)).filter(Boolean);
+  }, [grades, weekSel, mktSel]);
 
   const picks = useMemo(() => cohortOf(allPicks, cohort), [allPicks, cohort]);
   const sum = useMemo(() => summarise(picks), [picks]);
@@ -1823,6 +1891,11 @@ function ReportCard({ year, currentWeek }) {
         <div style={{ fontSize: 11.5, color: T.inkDim, marginTop: 3 }}>
           Of the picks you'd actually have taken, how many cleared their projected median —
           and where in the range they landed.
+          {mktSel !== "headline" && (
+            <span style={{ color: OVER_C }}>
+              {" "}Scoring <b>{(mktOpts.find((m) => m.id === mktSel) || {}).label}</b> only.
+            </span>
+          )}
         </div>
       </div>
 
@@ -1836,6 +1909,13 @@ function ReportCard({ year, currentWeek }) {
             fontFamily: "'Barlow Condensed',sans-serif", letterSpacing: .8, minHeight: 34,
           }}>{c.label}</button>
         ))}
+        {mktOpts.length > 0 && (
+          <select value={mktSel} onChange={(e) => setMktSel(e.target.value)} style={{ marginLeft: 4 }}
+            title="Which market to score">
+            <option value="headline">Yards (as graded)</option>
+            {mktOpts.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+          </select>
+        )}
         <select value={weekSel} onChange={(e) => setWeekSel(e.target.value)} style={{ marginLeft: 4 }}>
           <option value="all">All weeks</option>
           {grades.map((g) => <option key={g.week} value={g.week}>Week {g.week}</option>)}
