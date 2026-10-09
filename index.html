@@ -109,7 +109,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
  *  - teamrankings.com is NOT CORS-open; a browser page can never fetch it
  * ==================================================================== */
 
-const BUILD = "v12 · 2026-10-07";
+const BUILD = "v13 · 2026-10-09";
 
 const ESPN      = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_V2   = "https://site.api.espn.com/apis/v2/sports/football/nfl";
@@ -696,6 +696,122 @@ function resolveStarterQB(teamAbbr, chartQbs, injuriesForTeam, usage) {
   return { id: String(pick.id), via, promotedFrom, conflict };
 }
 
+/* ===================== PRACTICE REPORTS =====================
+ * The one signal ESPN cannot supply. Its per-athlete injuries endpoint returns
+ * zero items for every player (api-notes §15), and the game-summary block only
+ * carries the final game designation — Out / Questionable — which lands on
+ * Friday. Practice participation (DNP / Limited / Full) is filed Wednesday and
+ * Thursday, and it is the part that tells you on Thursday that a starter is in
+ * trouble instead of on Sunday.
+ *
+ * nflverse publishes it, on the same CORS-open GitHub host as everything else
+ * here, so the page can read it directly. Verified before building on it:
+ * week 5 rows were present on the Thursday, hours before kickoff, so the feed
+ * is prospective rather than a post-game record like its wind column.
+ *
+ * The join is gsis_id -> espn_id through that season's roster file (963KB, not
+ * the 25k-row all-time players file). 100% of SKILL-position injury rows
+ * resolve; the ~16% that don't are offensive linemen with no espn_id, and the
+ * board never projects them.
+ *
+ * Coverage fills in through the week — 21 of 32 teams on a Thursday evening —
+ * so a missing player means "nothing filed yet", never "healthy". Nothing here
+ * infers health from absence.
+ * ============================================================ */
+const NFLVERSE_DATA = "https://github.com/nflverse/nflverse-data/releases/download";
+/* nflverse keeps its own team vocabulary; these two disagree with ESPN's. */
+const NFLVERSE_TEAM = { LA: "LAR", WAS: "WSH" };
+const PRACTICE_SHORT = {
+  "Did Not Participate In Practice": "DNP",
+  "Limited Participation in Practice": "LIMITED",
+  "Full Participation in Practice": "FULL",
+};
+/* Ruled out for the week. Deliberately NOT the same as QB_OUT_RE, which also
+   matches season-long statuses like IR. */
+const RULED_OUT_RE = /^(out|doubtful)$/i;
+
+function parseCsvText(text) {
+  const split = (line) => {
+    const out = []; let cur = "", q = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (q) { if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; }
+      else if (c === '"') q = true;
+      else if (c === ",") { out.push(cur); cur = ""; }
+      else cur += c;
+    }
+    out.push(cur);
+    return out;
+  };
+  const lines = text.split("\n").filter((l) => l.length);
+  if (!lines.length) return [];
+  const head = split(lines[0]);
+  return lines.slice(1).map((l) => {
+    const c = split(l), o = {};
+    head.forEach((h, i) => { o[h] = c[i]; });
+    return o;
+  });
+}
+
+async function fetchCsv(url) {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return parseCsvText(await r.text());
+  } catch { return null; }
+}
+
+/**
+ * This week's practice and injury report, keyed by ESPN athlete id.
+ *
+ * Cached for an hour rather than the usual five minutes: the file is ~1MB and
+ * it changes a few times a week, not a few times an hour. Rescan clears it.
+ */
+async function getPracticeReport(year, week) {
+  const ck = `gx_inj_${year}_${week}`;
+  const hit = store.get(ck);
+  if (hit && Date.now() - hit.at < 60 * 60 * 1000) return hit.data;
+
+  const [roster, inj] = await Promise.all([
+    fetchCsv(`${NFLVERSE_DATA}/rosters/roster_${year}.csv`),
+    fetchCsv(`${NFLVERSE_DATA}/injuries/injuries_${year}.csv`),
+  ]);
+  if (!roster || !inj) return null;
+
+  const toEspn = {};
+  roster.forEach((r) => {
+    const g = (r.gsis_id || "").trim(), e = (r.espn_id || "").trim();
+    if (g && e) toEspn[g] = e;
+  });
+
+  const byEspn = {}, byTeam = {}, teams = new Set();
+  inj.filter((r) => +r.week === week && r.season_type === "REG").forEach((r) => {
+    const id = toEspn[(r.gsis_id || "").trim()];
+    const team = NFLVERSE_TEAM[r.team] || r.team;
+    teams.add(team);
+    if (!id) return;
+    const practice = r.practice_status || null;
+    const report = r.report_status || null;
+    byEspn[id] = {
+      practice, report,
+      practiceShort: practice ? (PRACTICE_SHORT[practice] || practice) : null,
+      injury: r.report_primary_injury || r.practice_primary_injury || null,
+      out: !!report && RULED_OUT_RE.test(report),
+      team, name: r.full_name,
+    };
+    /* Shaped like ESPN's injuriesById so the quarterback resolver can consume
+       both from one map without knowing where a status came from. */
+    if (report) {
+      byTeam[team] = byTeam[team] || {};
+      byTeam[team][id] = report;
+    }
+  });
+
+  const data = { week, year, byEspn, byTeam, teams: teams.size, rows: Object.keys(byEspn).length };
+  store.set(ck, { at: Date.now(), data });
+  return data;
+}
+
 /** Per-game log: recency, variance, and past meetings with this opponent. */
 async function getGameLog(playerId, season) {
   const d = await safeJSON(`${ESPN_WEB}/athletes/${playerId}/gamelog?season=${season}`);
@@ -1246,6 +1362,19 @@ async function runScan({ year, week, seasonType, league, tables, env, onProgress
       injByTeam[team] = Object.assign(injByTeam[team] || {}, map);
     });
   });
+  /* Practice reports, merged in BEFORE the quarterback is resolved. ESPN's
+     game-summary block carries the Friday designation at best; this adds the
+     Wednesday/Thursday filing, which is what catches a starter in trouble
+     early enough to matter. A team with nothing filed yet is left exactly as
+     ESPN had it — absence is never read as healthy. */
+  onProgress?.("Reading practice reports…");
+  const practice = await getPracticeReport(year, week);
+  if (practice) {
+    Object.entries(practice.byTeam).forEach(([team, map]) => {
+      injByTeam[team] = Object.assign(injByTeam[team] || {}, map);
+    });
+  }
+
   const starterQB = {};
   teamIds.forEach((t) => {
     const r = resolveStarterQB(t.abbr, chartQbOf[t.abbr], injByTeam[t.abbr], qbUsage);
@@ -1280,6 +1409,7 @@ async function runScan({ year, week, seasonType, league, tables, env, onProgress
 
   onProgress?.(`Scoring ${players.length} players…`);
   const rows = [];
+  const dropped = { noScore: 0, fewGames: 0, lowVolume: 0, maxGames: 0, considered: 0 };
   for (const p of players) {
     const kind = KIND_OF_POS(p.pos);
     if (!kind) continue;
@@ -1304,19 +1434,28 @@ async function runScan({ year, week, seasonType, league, tables, env, onProgress
       posMean, crossSeason, env, statSeason: league.season,
     };
     const a = analyze(p, kind, ctx);
-    if (a.score === null) continue;
-    if (!(a.gamesPlayed >= MIN_GAMES)) continue;
-    if (!(a.volume >= (MIN_VOLUME[kind] || 0))) continue;
+    if (a.score === null) { dropped.noScore++; continue; }
+    if (!(a.gamesPlayed >= MIN_GAMES)) {
+      dropped.fewGames++;
+      dropped.maxGames = Math.max(dropped.maxGames, a.gamesPlayed || 0);
+      continue;
+    }
+    if (!(a.volume >= (MIN_VOLUME[kind] || 0))) { dropped.lowVolume++; continue; }
     rows.push({
       player: p, kind, pos: p.pos, team: p.team, opp: meta.opp, home: meta.home,
       moved: p.moved, game: meta.game, ctx, analysis: a, score: a.score,
       depth: depthOf[p.id] || null,
       starter: kind === "QB" ? starterQB[p.team] || null : null,
+      report: practice?.byEspn?.[String(p.id)] || null,
       state: meta.game.state || "pre", started: hasStarted(meta.game),
       leakage: league.season === year && hasStarted(meta.game),
     });
   }
   rows.sort((a, b) => b.score - a.score);
+  /* An empty board should say which threshold emptied it, rather than leaving
+     "no qualifying players" to mean anything from a bye week to a bad season
+     resolution. */
+  dropped.considered = dropped.noScore + dropped.fewGames + dropped.lowVolume + rows.length;
 
   /* Enrich only what will be shown: game logs for the top of each board. */
   const groups = { QB: [], RB: [], WR: [], TE: [], DEF: [] };
@@ -1341,7 +1480,8 @@ async function runScan({ year, week, seasonType, league, tables, env, onProgress
   const played = started.filter((g) => g.state === "post" || g.completed).length;
   return {
     rows, games, byes, season: league.season, played, live: started.length - played,
-    starterQB, posMean,
+    starterQB, posMean, dropped,
+    practice: practice ? { teams: practice.teams, rows: practice.rows } : null,
     statYear: league.season, scanYear: year,
   };
 }
@@ -2355,6 +2495,7 @@ function PlayerCard({ p, kind, ctx }) {
         <span style={{ fontSize: 10, color: T.inkFaint }}>{p.pos} · {p.stats?.season || "—"} season</span>
         {a.archetype && <Badge label={a.archetype} tone="leather" />}
         {p.injury && <Badge label={p.injury.status} tone={/out|doubtful/i.test(p.injury.status) ? "cold" : "cool"} />}
+        {ctx.report && <ReportBadge r={ctx.report} />}
         <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{
             fontFamily: "'Barlow Condensed',sans-serif", fontSize: 25, fontWeight: 700,
@@ -2537,6 +2678,27 @@ const SCAN_TABS = [
   { key: "DEF", label: "DEF", match: (r) => r.kind === "DEF" },
 ];
 
+/**
+ * Practice and injury status in one badge.
+ *
+ * The two fields arrive on different clocks — practice participation on
+ * Wednesday and Thursday, the Out/Questionable designation on Friday — so this
+ * shows whichever exists rather than waiting for both. No badge means nothing
+ * was filed, which is NOT the same as healthy.
+ */
+function ReportBadge({ r }) {
+  if (!r) return null;
+  const parts = [];
+  if (r.report) parts.push(r.report.toUpperCase());
+  if (r.practiceShort) parts.push(r.practiceShort);
+  if (!parts.length) return null;
+  const tone = r.out ? "cold"
+    : /^dnp$/i.test(r.practiceShort || "") || /questionable/i.test(r.report || "") ? "cool"
+    : "leather";
+  return <Badge tone={tone} icon={r.out ? "\u26d4" : "\u2695"}
+    label={parts.join(" \u00b7 ") + (r.injury ? ` (${r.injury})` : "")} />;
+}
+
 function ScanRow({ rank, row, onOpen, marketId }) {
   const a = row.analysis;
   const v = marketView(a, marketId) || {};
@@ -2568,6 +2730,7 @@ function ScanRow({ rank, row, onOpen, marketId }) {
           {a.archetype && <Badge label={a.archetype} tone="leather" />}
           {row.moved && <Badge label={`stats w/ ${row.moved}`} tone="cool" icon="⇄" />}
           {row.depth > 1 && <Badge label={`${row.pos}${row.depth} on depth chart`} tone="cool" />}
+          {row.report && <ReportBadge r={row.report} />}
           {row.starter?.promotedFrom && <Badge tone="cold" icon="⚠"
             label={`starting — listed QB1 ${row.starter.promotedFrom.status}`} />}
           {row.starter?.conflict && <Badge tone="cool" icon="?"
@@ -2600,6 +2763,7 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
   const [tab, setTab] = useState("QB");
   const [includePlayed, setIncludePlayed] = useState(false);
   const [startersOnly, setStartersOnly] = useState(true);
+  const [hideOut, setHideOut] = useState(true);
   const [sortBy, setSortBy] = useState("proj");   // proj | edge
   /* market choice is remembered per position, so flipping QB to Pass Att
      doesn't silently change what RB is showing */
@@ -2613,8 +2777,13 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
     let rs = includePlayed ? allRows : allRows.filter((r) => !r.started);
     if (startersOnly) rs = rs.filter((r) => r.kind === "DEF" || r.depth == null
       || DEPTH_LIMIT[r.pos] === undefined || r.depth <= DEPTH_LIMIT[r.pos]);
+    /* Only players actually ruled OUT or DOUBTFUL. A DNP on Wednesday is a
+       flag, not a removal — plenty of veterans never practise on Wednesday. */
+    if (hideOut) rs = rs.filter((r) => !r.report?.out);
     return rs;
-  }, [allRows, includePlayed, startersOnly]);
+  }, [allRows, includePlayed, startersOnly, hideOut]);
+  const ruledOut = useMemo(
+    () => allRows.filter((r) => r.report?.out && active.match(r)).length, [allRows, tab]);
   const viewOf = (r) => marketView(r.analysis, marketId);
   const projOf = (r) => { const v = viewOf(r)?.proj; return isFinite(v) ? v : -1; };
   const scoreOf = (r) => { const v = viewOf(r)?.score; return isFinite(v) ? v : -1; };
@@ -2648,6 +2817,13 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
             <span style={{ color: T.gold }}> (prior season — {scan.scanYear} has no usable sample yet)</span>
           )}
         </div>
+        {scan?.practice && scan.practice.teams < 32 && (
+          <div style={{ marginTop: 9, fontSize: 10.5, color: "#e8c9ac", lineHeight: 1.5 }}>
+            Practice report covers {scan.practice.teams} of 32 teams so far
+            ({scan.practice.rows} players). It fills in Wednesday through Friday — a player
+            with no badge has nothing filed yet, which is not the same as healthy.
+          </div>
+        )}
         {scan && (scan.played > 0 || scan.live > 0) && (
           <div style={{
             marginTop: 9, padding: "8px 11px", borderRadius: 4, fontSize: 11,
@@ -2694,6 +2870,15 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
             onChange={(e) => setStartersOnly(e.target.checked)}
             style={{ accentColor: T.gold, cursor: "pointer", width: "auto" }} />
           Starters only
+        </label>
+        <label style={{
+          display: "inline-flex", alignItems: "center", gap: 6,
+          fontSize: 11, color: T.inkDim, cursor: "pointer", userSelect: "none",
+        }} title="Removes players with an Out or Doubtful designation">
+          <input type="checkbox" checked={hideOut}
+            onChange={(e) => setHideOut(e.target.checked)}
+            style={{ accentColor: T.gold, cursor: "pointer", width: "auto" }} />
+          Hide ruled out{ruledOut > 0 ? ` (${ruledOut})` : ""}
         </label>
         <label style={{
           display: "inline-flex", alignItems: "center", gap: 6,
@@ -2752,8 +2937,37 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
           </Panel>
         )}
         {!scanning && !scan?.empty && top.length === 0 && (
-          <Panel style={{ padding: "22px 18px", fontSize: 12, color: T.inkDim }}>
-            No qualifying {active.label} met the volume threshold for this slate.
+          <Panel style={{ padding: "20px 18px", fontSize: 12, color: T.inkDim, lineHeight: 1.65 }}>
+            <div style={{ color: T.chalk, fontWeight: 600, marginBottom: 6 }}>
+              No qualifying {active.label} on this slate.
+            </div>
+            {scan?.dropped?.considered > 0 && (
+              <div>
+                Of {scan.dropped.considered} players scored:{" "}
+                {scan.dropped.fewGames > 0 && (
+                  <b style={{ color: scan.dropped.fewGames > scan.dropped.considered * 0.8 ? UNDER_C : T.ink }}>
+                    {scan.dropped.fewGames} had fewer than {MIN_GAMES} games
+                    {scan.dropped.maxGames > 0 ? ` (the most anyone had was ${scan.dropped.maxGames})` : ""}
+                  </b>
+                )}
+                {scan.dropped.fewGames > 0 && scan.dropped.lowVolume > 0 && ", "}
+                {scan.dropped.lowVolume > 0 && `${scan.dropped.lowVolume} were under the volume threshold`}
+                {scan.dropped.noScore > 0 && `, ${scan.dropped.noScore} had no gradeable stats`}.
+              </div>
+            )}
+            {scan?.dropped?.fewGames > 0 && scan.dropped.fewGames > scan.dropped.considered * 0.8 && (
+              <div style={{ marginTop: 8, color: "#f0c9a8" }}>
+                That is the whole slate failing one threshold, which means the stat season
+                resolved to one nobody has played {MIN_GAMES} games in yet. Hard-reload to
+                re-resolve it; if it persists, the season switch and {`MIN_GAMES`} have drifted
+                apart again.
+              </div>
+            )}
+            {scan && scan.statYear !== scan.scanYear && (
+              <div style={{ marginTop: 8, fontSize: 11, color: T.inkFaint }}>
+                Using {scan.statYear} stats — {scan.scanYear} has no usable sample yet.
+              </div>
+            )}
           </Panel>
         )}
         {!scanning && top.length > 0 && (
@@ -2890,6 +3104,15 @@ function GameView({ game, league, tables, year, posMean, env, onBack }) {
       + " · " + d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
   }, [game.date]);
 
+  /* Same practice report the board uses, so a card never disagrees with the
+     row that opened it. Cached for an hour, so this is normally free. */
+  const [practice, setPractice] = useState(null);
+  useEffect(() => {
+    let live = true;
+    getPracticeReport(year, week).then((r) => { if (live) setPractice(r); });
+    return () => { live = false; };
+  }, [year, week]);
+
   const wx = detail?.weather;
   const indoor = game.indoor || detail?.indoor;
   const temp = num(wx?.temp), gust = num(wx?.gust);
@@ -2907,6 +3130,7 @@ function GameView({ game, league, tables, year, posMean, env, onBack }) {
         wx, indoor, implied: impliedFor, log,
         oppHistory: log ? log.filter((g) => g.opp === def.abbr) : null,
         posMean, crossSeason: league.season !== year, env, statSeason: league.season,
+        report: practice?.byEspn?.[String(p.id)] || null,
       };
       const a = analyze(p, kind, ctx);
       const head = a.headline;
@@ -2917,7 +3141,7 @@ function GameView({ game, league, tables, year, posMean, env, onBack }) {
       QB: build(groups.QB, "QB"), REC: build(groups.REC, "REC"),
       RB: build(groups.RB, "RB"), DEF: build(groups.DEF, "DEF"),
     };
-  }, [groups, logs, def.abbr, defRow, offRow, tables, wx, indoor, impliedFor, posMean, env, league.season, year]);
+  }, [groups, logs, def.abbr, defRow, offRow, tables, wx, indoor, impliedFor, posMean, env, league.season, year, practice]);
 
   const jump = (k) => secRefs[k]?.current?.scrollIntoView({ behavior: "smooth", block: "start" });
 
@@ -3046,10 +3270,29 @@ function GameView({ game, league, tables, year, posMean, env, onBack }) {
 
 /* --------------------------------- app --------------------------------- */
 
+/**
+ * Has this season played enough for the board to use its stats?
+ *
+ * The threshold is MIN_GAMES on purpose, and that is the whole fix for a dead
+ * zone that opened every season at weeks 5-6. This used to flip to the current
+ * season once the median team had played 4 games, while the board separately
+ * requires MIN_GAMES (6) from each PLAYER. Between those two numbers the tool
+ * switched to a season in which nobody could qualify and rendered an empty
+ * board at every position — it looked like a broken scan, but both halves were
+ * doing exactly what they were told.
+ *
+ * Deriving it from MIN_GAMES means the two cannot drift apart again. It also
+ * matches what was measured: docs/weeks2-3-2026.md found blending
+ * current-season data in early "barely helped (MAE 52.0 -> 51.3 at best), two
+ * games is too noisy", and said to retest around week 6-8. This lands there.
+ *
+ * Week 1 trap, still handled: test the MEDIAN team, not the sum. After a
+ * Thursday opener two teams have played and thirty have not.
+ */
 function seasonHasSample(standings) {
   if (!standings.length) return false;
   const gps = standings.map((t) => t.gp || 0).sort((a, b) => a - b);
-  return gps[Math.floor(gps.length / 2)] >= 4;
+  return gps[Math.floor(gps.length / 2)] >= MIN_GAMES;
 }
 function walkStandings(node, out = []) {
   if (!node) return out;

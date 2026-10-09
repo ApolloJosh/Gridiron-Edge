@@ -39,7 +39,8 @@ expect this week**:
 Covered positions:
 
 - **QB** — exactly one per team. The starter is resolved from the depth chart, filtered by this
-  game's injury report, and cross-checked against who's actually throwing the ball this season;
+  game's injury report *and the week's practice report*, and cross-checked against who's actually
+  throwing the ball this season;
   a promoted backup or an unclear QB situation is flagged on the card. Backup QBs are never
   projected — unlike every other position, QB2 doesn't take snaps.
 - **QB stats** — yards/game, passer rating, YPA, completion %, TD%, INT%, TD/game, rush yards/game
@@ -198,7 +199,7 @@ generator, then price it against your book's actual number.
 Open `index.html` in any browser. No build step, no install, no account, no API key.
 Requires an internet connection to pull live ESPN data. Works on phones.
 
-**Check the build stamp.** The header shows a version (e.g. `v12 · 2026-10-07`). If it doesn't
+**Check the build stamp.** The header shows a version (e.g. `v13 · 2026-10-09`). If it doesn't
 match the build you just updated to, you're looking at a cached or older copy — hard-reload
 (⌘⇧R), and if you're on GitHub Pages give it a minute to publish.
 
@@ -223,7 +224,7 @@ falls back automatically, and labels which season each stat came from.
 
 - [ ] Run the closing-line factor at player level and ship or kill it ([lines.md](docs/lines.md))
 - [ ] Live wind from a real forecast source — nflverse's wind is recorded after kickoff, not predicted
-- [ ] Practice reports (DNP / Limited / Full) — the one signal that changes who is *on* the board
+- [x] ~~Practice reports (DNP / Limited / Full)~~ — v13: badges on every row and card, Out/Doubtful filtered by default, and merged into the QB starter resolution
 - [x] ~~Snap counts~~ — tested and rejected: the signal is usage signal the box score already has ([bench.md](docs/bench.md))
 - [ ] Model the kickoff-window / game-script factor
 - [ ] Defense vs archetype (needs a charting data source — PFF, Sports Info Solutions)
