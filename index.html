@@ -109,7 +109,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
  *  - teamrankings.com is NOT CORS-open; a browser page can never fetch it
  * ==================================================================== */
 
-const BUILD = "v13 · 2026-10-09";
+const BUILD = "v14 · 2026-10-09";
 
 const ESPN      = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_V2   = "https://site.api.espn.com/apis/v2/sports/football/nfl";
@@ -2764,7 +2764,11 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
   const [includePlayed, setIncludePlayed] = useState(false);
   const [startersOnly, setStartersOnly] = useState(true);
   const [hideOut, setHideOut] = useState(true);
-  const [sortBy, setSortBy] = useState("proj");   // proj | edge
+  /* EDGE by default. Projection sorting is only meaningful when every row is
+     in the same unit, and a market that some players' logs don't carry falls
+     those rows back to yards — ranking 232 pass yards above 26 completions is
+     not a ranking at all. */
+  const [sortBy, setSortBy] = useState("edge");   // proj | edge
   /* market choice is remembered per position, so flipping QB to Pass Att
      doesn't silently change what RB is showing */
   const [market, setMarket] = useState({});
@@ -2787,9 +2791,19 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
   const viewOf = (r) => marketView(r.analysis, marketId);
   const projOf = (r) => { const v = viewOf(r)?.proj; return isFinite(v) ? v : -1; };
   const scoreOf = (r) => { const v = viewOf(r)?.score; return isFinite(v) ? v : -1; };
+  /* A row whose log doesn't carry the selected market is shown on yards, which
+     is a different unit AND a different EDGE definition. It stays on the board
+     — hiding it would silently shrink the slate — but it never outranks a row
+     that actually has the market. */
+  const hasMarket = (r) => viewOf(r)?.avail !== false;
   const top = useMemo(() => {
     const list = rows.filter(active.match);
-    list.sort(sortBy === "proj" ? (a, b) => projOf(b) - projOf(a) : (a, b) => scoreOf(b) - scoreOf(a));
+    const rank = sortBy === "proj" ? projOf : scoreOf;
+    list.sort((a, b) => {
+      const ha = hasMarket(a), hb = hasMarket(b);
+      if (ha !== hb) return ha ? -1 : 1;
+      return rank(b) - rank(a);
+    });
     return list.slice(0, 10);
   }, [rows, tab, sortBy, marketId]);
   /* how many of the shown players actually have this market in their log */
@@ -3004,7 +3018,7 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
 
 /* ------------------------------ game view ------------------------------ */
 
-function GameView({ game, league, tables, year, posMean, env, onBack }) {
+function GameView({ game, league, tables, year, week, posMean, env, onBack }) {
   const secRefs = {
     QB: useRef(null), REC: useRef(null), RB: useRef(null), DEF: useRef(null),
   };
@@ -3108,8 +3122,14 @@ function GameView({ game, league, tables, year, posMean, env, onBack }) {
      row that opened it. Cached for an hour, so this is normally free. */
   const [practice, setPractice] = useState(null);
   useEffect(() => {
+    if (!year || !week) return;
     let live = true;
-    getPracticeReport(year, week).then((r) => { if (live) setPractice(r); });
+    /* The report is a garnish on this view; it must never be able to take the
+       whole matchup down. A missing `week` prop did exactly that in v13. */
+    Promise.resolve()
+      .then(() => getPracticeReport(year, week))
+      .then((r) => { if (live) setPractice(r); })
+      .catch(() => {});
     return () => { live = false; };
   }, [year, week]);
 
@@ -3536,7 +3556,8 @@ function App() {
           )}
           {tables && selected && (
             <GameView key={selected.id} game={selected} league={league} tables={tables}
-              year={year} posMean={scan?.posMean} env={env} onBack={() => setSelected(null)} />
+              year={year} week={week} posMean={scan?.posMean} env={env}
+              onBack={() => setSelected(null)} />
           )}
         </div>
       </div>

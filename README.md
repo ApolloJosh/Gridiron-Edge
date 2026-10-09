@@ -69,6 +69,11 @@ cleared their projected **median**, and where in the range they landed.
 - **Market picker** — score carries, receptions or a combination market instead of yards. Each
   scan snapshots every market with its own band and EDGE, so any of them can be graded after
   the fact.
+
+The board sorts by **EDGE** by default. Projection sorting only means something when every row
+shares a unit, and a market some players' game logs don't carry falls those rows back to yards —
+ranking 232 pass yards above 26 completions isn't a ranking. Rows missing the selected market
+stay on the board, marked, but never outrank one that has it.
 - **Week coverage** — if a week isn't on the board, the board says why in plain language rather
   than omitting it: no snapshot was taken before kickoff, the week is still in progress (with
   the game count), or grading errored. A week graded on a partial slate is labeled as such.
@@ -199,7 +204,7 @@ generator, then price it against your book's actual number.
 Open `index.html` in any browser. No build step, no install, no account, no API key.
 Requires an internet connection to pull live ESPN data. Works on phones.
 
-**Check the build stamp.** The header shows a version (e.g. `v13 · 2026-10-09`). If it doesn't
+**Check the build stamp.** The header shows a version (e.g. `v14 · 2026-10-09`). If it doesn't
 match the build you just updated to, you're looking at a cached or older copy — hard-reload
 (⌘⇧R), and if you're on GitHub Pages give it a minute to publish.
 
