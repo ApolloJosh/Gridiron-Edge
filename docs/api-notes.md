@@ -301,3 +301,77 @@ and meaningless. The test is the **median** team's games played (`>= 4`), not th
 Verified: with the median rule at Week 1 of 2026, the tool falls back to 2025 and returns
 all 32 teams with real separation (SEA 17.2 PPG allowed, DAL 30.1), and pass-defense and
 run-defense ranks differ from one another as they should.
+
+## 17. The unparameterized scoreboard's week number is not "the last completed week"
+
+`GET /scoreboard` with no `week`/`dates` params returns a `week.number` that ESPN flips on its
+own schedule — generally after Monday night, but not reliably at a fixed hour, and it points at
+the **upcoming** week for most of the week. Two consequences, both of which bit this app:
+
+- **Never bound a loop over completed weeks with `w < week.number`.** During the window where
+  ESPN still reported week 4 on the Tuesday after week 4 went final, the Report Card's
+  `for (let w = 1; w < currentWeek; w++)` silently excluded week 4 — the week the user was
+  looking for. Enumerate what you actually have instead: `snapshotWeeks(year)` reads the
+  `gx_proj_{year}_{w}` keys out of localStorage, so the grader's week list is driven by data on
+  the device rather than by ESPN's clock. Grade up to and including the current week and let
+  the "is it final?" test decide.
+- **A week's own schedule is the only authority on whether it is done.** Fetch
+  `?seasontype=2&week=W&dates=Y` and count games where `state === "post"` or
+  `completed === true`. `state === "in"` is a live game with a partial box score — scoring a
+  pick off it understates the player, so hold those picks back rather than counting them as
+  misses, and don't cache a grade for a week that isn't fully final.
+
+## 18. What ESPN doesn't keep, nflverse does — and it's CORS-open
+
+Two fields the model needs have never been obtainable from ESPN: historical
+closing lines (§11 — odds live on upcoming games only) and wind speed (§6 — the
+weather block has `temperature` and `gust`, never `windSpeed`).
+
+[`nflverse/nfldata`](https://github.com/nflverse/nfldata)'s `data/games.csv` has
+both, for every game since 1999, and `raw.githubusercontent.com` serves it with
+`access-control-allow-origin: *` — so a `file://` page can `fetch()` it directly,
+no key, no proxy, no scraper. Full write-up in [lines.md](lines.md).
+
+Traps, all measured:
+
+- **`spread_line` is from the HOME perspective, positive = home favored.** Of 319
+  home-favored games in 2024–25 the home team won 219 (68.7%), which is the check
+  that settles the sign.
+- **`wind` and `temp` are populated only AFTER kickoff** — zero coverage on every
+  future week. They are observations, not forecasts. Backtest with them; never
+  project with them.
+- **Lines post about two weeks ahead.** Weeks 5–6 carry a line while 7+ are empty,
+  so absence of a line means "not yet", not "no line".
+- **Team codes differ from ESPN's in exactly two places:** `LA` → `LAR` and
+  `WAS` → `WSH`. Diffed across all 32; nothing else disagrees. The `espn` column
+  carries ESPN's own game id, so prefer joining on that where you can.
+- `games.csv` **does** contain quoted fields (156 quote characters), so a naive
+  `split(",")` parser will eventually corrupt a row. Use a quote-aware split.
+
+## 19. Practice reports: the signal ESPN has no endpoint for
+
+ESPN's per-athlete injuries endpoint returns zero items for every player (§15), and the
+game-summary block carries only the **final game designation** — Out / Questionable — which
+teams file on Friday. Practice participation (DNP / Limited / Full) is filed Wednesday and
+Thursday and is the part that warns you early.
+
+nflverse publishes it at `injuries_{year}.csv`, on the same CORS-open GitHub host as
+everything else, so the page reads it directly at runtime.
+
+Measured before building on it:
+
+- **It is prospective.** Week 5 rows were present on the Thursday, hours before kickoff — not
+  a post-game record like the `wind` column in `games.csv` (§18). This is the test that
+  mattered; absent it, the whole feature would have been backtest-only.
+- **Join through the SEASON roster, not the all-time players file.**
+  `rosters/roster_{year}.csv` is 963KB and carries `gsis_id` and `espn_id` together;
+  `players/players.csv` is 25k rows. **100% of skill-position injury rows resolve** through the
+  roster file. The ~16% that don't are offensive linemen with no `espn_id`, and the board
+  never projects them.
+- **The two fields arrive on different clocks.** `practice_status` fills in Wednesday–Thursday;
+  `report_status` is mostly blank until Friday (213 of 222 week-5 rows when first checked).
+  Render whichever exists rather than waiting for both.
+- **Coverage is partial all week** — 21 of 32 teams on a Thursday evening. A player with no
+  row has nothing filed, which is **not** the same as healthy, and nothing in the app may infer
+  health from absence.
+- Team codes are nflverse's, so `LA → LAR` and `WAS → WSH` apply here too.
