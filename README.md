@@ -112,15 +112,24 @@ the opponent term still isn't paying for itself (weight cut 40% → 15%).
 Every constant in the model was chosen by backtest, not by intuition — 3,084 player-games,
 predicting each week from prior weeks only. Full write-up in [`docs/model.md`](docs/model.md),
 re-runnable harness in [`docs/backtest.js`](docs/backtest.js); the closing-line work lives in
-[`docs/lines.md`](docs/lines.md). New factors are now tested offline in a few seconds with
-[`docs/bench.js`](docs/bench.js) — no ESPN, no browser ([how it works](docs/bench.md)). The
-headlines:
+[`docs/lines.md`](docs/lines.md), the graded line in
+[`docs/medshrink.md`](docs/medshrink.md). New factors are now tested offline in a few seconds
+with [`docs/bench.js`](docs/bench.js) — no ESPN, no browser ([how it works](docs/bench.md)).
+The headlines:
 
 - **Opponent rushing defense barely predicts anything.** Full-strength opponent adjustment made
   RB projections *worse* (MAE 26.57 → 27.04). Optimal exponent ≈ 0.10, i.e. almost off.
   Residual correlation: 0.049. Team rushing-defense stats are mostly a game-script artifact.
 - **Opponent passing defense does predict, mildly.** QB yards improve at exponent 0.25
   (65.35 → 64.65), residual correlation 0.141. The asymmetry is measured, not assumed.
+- **The line an over is graded against was too high for good players.** Until v15 the band's
+  median was the raw prior median while the point estimate beside it was shrunk. Over rate by
+  prior-median quintile showed the weakest qualified players beating their line 56–70% of the
+  time while the *top* of the board — the only part worth betting — came in at 36–40%. Eight
+  markets now shrink the band toward a measured anchor and land their top quintile at 45–55%,
+  with the overall over-rate moving at most 2.3 points. Five markets failed the two-season bar
+  and deliberately keep the raw median, **Pass Yds among them — it still sags +30.7**
+  ([medshrink.md](docs/medshrink.md)).
 - **Recency helps volume, hurts passing.** Carries blend 50/50 season+last-3 (4.30 → 4.20 MAE);
   last-3 passing yards is 7% *worse* than the season average.
 - **The closing line knows about points, not yards.** A team's implied total correlates
@@ -173,6 +182,7 @@ and marks what is still pending. Adding a factor is one object in `buildFactors(
 | Defensive-player volume | **active** | Opposing offense's actual plays per game vs league average |
 | Vegas implied team total | *context — tested, RB only* | Measured at player level over two seasons. No blanket signal (residual corr −0.009 / +0.037). **Running backs** clear it: +0.068 / +0.084, both seasons picking k≈0.6, MAE better in both while bias moves *away* from zero — signal, not bias absorption. QB looked promising and failed that same test. Gain is 0.2 yards; not yet wired in. See [lines.md](docs/lines.md) |
 | Defense vs archetype | *pending* | Needs charting data ESPN doesn't expose publicly |
+| Band median shrinkage | **active, 8 of 13 markets** | The graded line, pulled toward a per-market anchor by the regression slope of actual on prior median. Per market, not per position: Carries 0.70, Rush+Rec would want 0.85. Five markets kept raw because their two seasons disagreed or a straight line didn't describe them ([medshrink.md](docs/medshrink.md)) |
 
 **Archetypes are already classified** from production shape — Deep threat, Volume WR1,
 Possession WR, Receiving back, Bruiser, Explosive back, Move TE, Dual threat, Pocket passer.
@@ -204,7 +214,7 @@ generator, then price it against your book's actual number.
 Open `index.html` in any browser. No build step, no install, no account, no API key.
 Requires an internet connection to pull live ESPN data. Works on phones.
 
-**Check the build stamp.** The header shows a version (e.g. `v14 · 2026-10-09`). If it doesn't
+**Check the build stamp.** The header shows a version (e.g. `v15 · 2026-10-14`). If it doesn't
 match the build you just updated to, you're looking at a cached or older copy — hard-reload
 (⌘⇧R), and if you're on GitHub Pages give it a minute to publish.
 
@@ -231,6 +241,9 @@ falls back automatically, and labels which season each stat came from.
 - [ ] Live wind from a real forecast source — nflverse's wind is recorded after kickoff, not predicted
 - [x] ~~Practice reports (DNP / Limited / Full)~~ — v13: badges on every row and card, Out/Doubtful filtered by default, and merged into the QB starter resolution
 - [x] ~~Snap counts~~ — tested and rejected: the signal is usage signal the box score already has ([bench.md](docs/bench.md))
+- [x] ~~Shrink the line an over is graded against~~ — v15: 8 markets, top-quintile over rate 36–40% → 45–55% ([medshrink.md](docs/medshrink.md))
+- [ ] Fix the 5 markets still priced on a raw median — Pass Yds sags +30.7 and Pass+Rush +34.8; their slopes split across seasons, so they need a different treatment, not an averaged constant
+- [ ] Re-shrink QB point estimates — their MAE floor sits at k≈0.30–0.45, 3–5% better than the shipped `SHRINK.QB = 0.90`, a bigger gain than the closing-line work produced ([medshrink.md](docs/medshrink.md))
 - [ ] Model the kickoff-window / game-script factor
 - [ ] Defense vs archetype (needs a charting data source — PFF, Sports Info Solutions)
 - [ ] True yards allowed by position (requires aggregating opponent box scores)

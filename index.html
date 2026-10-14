@@ -109,7 +109,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
  *  - teamrankings.com is NOT CORS-open; a browser page can never fetch it
  * ==================================================================== */
 
-const BUILD = "v14 · 2026-10-09";
+const BUILD = "v15 · 2026-10-14";
 
 const ESPN      = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_V2   = "https://site.api.espn.com/apis/v2/sports/football/nfl";
@@ -917,6 +917,117 @@ function shrinkBaseline(base, kind, ctx) {
   return pm + (base - pm) * k;
 }
 
+/* ======================= THE GRADED LINE =======================
+ * The point estimate above is shrunk; until v15 the band under it was not.
+ * That split mattered, because the band's MEDIAN is what an over is actually
+ * priced and graded against. A raw prior median is a biased line -- biased
+ * further the better the player is -- so the top of the board, which is the
+ * only part of it anyone bets, was graded against numbers that were too high.
+ *
+ * Measured on 2024+2025 nflverse weekly stats, holdout (week W uses weeks < W
+ * only, for the player's own median AND for the pool median that anchors it).
+ * Over-rate by prior-median quintile, ties excluded, as shipped at k = 1:
+ *
+ *   market            Q1     Q5     sag
+ *   Carries         56.4   38.1   +18.3
+ *   Rush Yds        57.8   38.2   +19.6
+ *   Receptions WR   57.5   38.4   +19.1
+ *   Rec Yds WR      55.4   39.0   +16.4
+ *   Completions     69.8   36.2   +33.6
+ *
+ * A fair line sits every quintile at 50. Q5 at 36-40 is the signature of a
+ * line that is too high at the top -- exactly where the picks come from.
+ *
+ * Two constants per market, and NEITHER could be borrowed from the path above:
+ *
+ *  - k is the OLS slope of actual on prior median. Shrinking toward an anchor
+ *    A by k gives A(1-k) + k*line, which IS the OLS prediction when k = b, so
+ *    the regression states the coefficient outright rather than it being swept.
+ *    It is per MARKET, not per position: within running backs Rush+Rec wants
+ *    0.85 where Carries wants 0.70. The slope is attenuated by noise in the
+ *    median itself, and that is correct here -- the job is the best prediction
+ *    from an observed noisy line, not a structural parameter.
+ *  - a is the pool median of posted lines. tiers[2] is a percentile of per-game
+ *    AVERAGES and sits 22 yards below it for pass yards; shrinking toward that
+ *    lowers every quarterback's line and lifts the field over-rate from 53% to
+ *    58%. That is a lowered line, not a found edge. The regression's own
+ *    implied level a/(1-b) is no better -- 13 yards high for Rec Yds, costing
+ *    6 points of field rate. The pool median is the level-neutral one.
+ *
+ * A market ships a constant only when it clears all three bars:
+ *   1. the two seasons' slopes agree within 0.15 (a one-season constant is a
+ *      constant fitted to noise -- docs/bench.md records what that cost before)
+ *   2. |sag| at the shipped k comes in under 6
+ *   3. the field over-rate moves less than 2.5 points, so the sag flattens
+ *      without the whole board drifting over
+ *
+ * Five markets failed and keep k = 1 deliberately: Pass Yds (slopes 0.29 vs
+ * 0.55) and Pass+Rush Yds (0.25 vs 0.54) disagree across seasons; Rush+Rec
+ * Yds and RB Receptions overshoot to a NEGATIVE sag at their regression k,
+ * meaning the straight line does not describe them; Rec Yds TE splits 0.75 vs
+ * 0.57 on 560 rows. Their medians stay raw. An absent market is not an
+ * oversight -- docs/medshrink.md has the full table and node docs/medshrink.js
+ * reproduces it.
+ *
+ * The point estimate is deliberately left alone. It answers "how many yards
+ * will he get" and is validated on MAE; the median answers "where is the fair
+ * line" and is validated on calibration. They are different estimands, and
+ * the MAE sweep (docs/medshrink.js) shows the cost of this k to the point
+ * estimate would be under 1.1% either way -- not a reason to disturb a
+ * separately validated constant inside this change.
+ * ============================================================ */
+/* Stamped into every snapshot. A week saved without it was priced by the raw
+   median, before v15 -- the Report Card can then say which weeks are which
+   instead of comparing two different pricing rules as though they were one. */
+const BAND_VERSION = 2;
+
+const MED_SHRINK = {
+  /* market: { position (or "*"): { a: anchor, k: coefficient } } */
+  passAtt: { "*": { a: 30.0, k: 0.30 } },   // slopes 0.25 / 0.33   sag +31.4 -> -0.6
+  passCmp: { "*": { a: 20.0, k: 0.40 } },   // slopes 0.40 / 0.44   sag +33.6 -> -1.5
+  rushYds: { "*": { a: 55.5, k: 0.65 } },   // slopes 0.74 / 0.62   sag +19.6 -> -5.3
+  rushAtt: { "*": { a: 13.5, k: 0.70 } },   // slopes 0.76 / 0.66   sag +18.3 -> -1.9
+  recYds:  { WR:  { a: 45.3, k: 0.65 } },   // slopes 0.62 / 0.68   sag +16.4 -> -5.3
+  rec:     { WR:  { a: 4.0,  k: 0.75 },     // slopes 0.79 / 0.71   sag +19.1 -> -1.7
+             TE:  { a: 4.0,  k: 0.65 } },   // slopes 0.69 / 0.61   sag +26.5 -> +2.2
+  tgt:     { "*": { a: 6.0,  k: 0.75 } },   // slopes 0.77 / 0.74   sag +16.0 -> -2.2
+};
+
+/** The shrinkage for one market and position, or null to leave the band raw. */
+function medShrinkFor(mkId, pos) {
+  if (!mkId) return null;
+  const m = MED_SHRINK[mkId];
+  if (!m) return null;
+  return m[pos] || m["*"] || null;
+}
+
+/**
+ * Build the displayed and graded band from a raw distribution.
+ *
+ * Shrink happens in per-game units, where the anchors were measured, and the
+ * opponent/environment multiplier is applied after -- reversing that order
+ * would measure the anchor against a number that has already been scaled.
+ *
+ * p25 and p75 are pulled by the same k as the median so the band keeps its
+ * shape: a zone whose edges moved differently from its centre would no longer
+ * mean what the card says it means.
+ */
+function shrinkBand(dist, mult, mkId, pos) {
+  if (!dist) return null;
+  const s = medShrinkFor(mkId, pos);
+  const m = isFinite(mult) ? mult : 1;
+  const pull = (v) => {
+    if (!isFinite(v)) return v;
+    /* a line below zero is not a line */
+    return Math.max(0, s ? s.a + (v - s.a) * s.k : v) * m;
+  };
+  return {
+    ...dist,
+    medShrink: s ? s.k : 1,
+    p25adj: pull(dist.p25), p75adj: pull(dist.p75), medianAdj: pull(dist.median),
+  };
+}
+
 /* ======================= PROP MARKETS =======================
  * The board can be pointed at any market, not just yards, because yards are
  * the noisiest thing on the board. Measured across 2024-25 (docs/markets.md):
@@ -1048,7 +1159,7 @@ function buildMarkets(kind, pos, ctx, { log, passMult, rushMult, softness, isRus
     out[m.id] = {
       ...m, avail: true, tiers, n: series.length, seasonAvg, mult,
       proj: base * mult,
-      band: dist ? { ...dist, p25adj: dist.p25 * mult, p75adj: dist.p75 * mult, medianAdj: dist.median * mult } : null,
+      band: shrinkBand(dist, mult, m.id, pos),
       grade: g,
       score: ps === null ? null : Math.round((ps * EDGE_W_PLAYER + softness * EDGE_W_OPP) * 100),
     };
@@ -1264,7 +1375,9 @@ function analyze(p, kind, ctx) {
   let band = null;
   if (dist && headline) {
     const m = phase === "rush" ? rushMult : passMult;
-    band = { ...dist, p25adj: dist.p25 * m, p75adj: dist.p75 * m, medianAdj: dist.median * m };
+    /* The headline stat IS this position's default market, so the band under
+       it is graded by the same constants as any other market's band. */
+    band = shrinkBand(dist, m, defaultMarket(kind), p.pos);
   }
 
   const defRank = kind === "DEF" ? ctx.offRow?.rankPlays
@@ -1474,7 +1587,13 @@ async function runScan({ year, week, seasonType, league, tables, env, onProgress
     r.score = r.analysis.score;
   });
 
-  try { saveProjections(year, week, rows); } catch {}
+  /* Once the first game of a week has kicked off, its snapshot stops being a
+     forecast and becomes the record of what the board showed. Re-scanning must
+     not rewrite it: the stored medians are the lines the Report Card graded
+     against, and v15 changed how those medians are built. Overwriting them
+     would silently restate history as if the new constants had always been
+     there, destroying the only honest scoreboard there is. */
+  try { saveProjections(year, week, rows, { live: games.some(hasStarted) }); } catch {}
 
   const started = games.filter(hasStarted);
   const played = started.filter((g) => g.state === "post" || g.completed).length;
@@ -1532,7 +1651,8 @@ function snapMarkets(r) {
   return Object.keys(out).length ? out : null;
 }
 
-function saveProjections(year, week, rows) {
+function saveProjections(year, week, rows, { live = false } = {}) {
+  if (live && store.get(`gx_proj_${year}_${week}`)) return;
   const snap = rows
     .filter(boardVisible)
     .filter((r) => r.kind !== "DEF" && r.analysis?.headline?.logKey)
@@ -1554,7 +1674,7 @@ function saveProjections(year, week, rows) {
       markets: snapMarkets(r),
     }))
     .filter((x) => isFinite(x.proj));
-  if (snap.length) store.set(`gx_proj_${year}_${week}`, { year, week, savedAt: Date.now(), rows: snap });
+  if (snap.length) store.set(`gx_proj_${year}_${week}`, { year, week, savedAt: Date.now(), band: BAND_VERSION, rows: snap });
 }
 
 /** Per-player actuals for a finished week, from box scores. */
