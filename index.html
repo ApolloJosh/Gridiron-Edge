@@ -109,12 +109,16 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
  *  - teamrankings.com is NOT CORS-open; a browser page can never fetch it
  * ==================================================================== */
 
-const BUILD = "v15 · 2026-10-14";
+const BUILD = "v16 · 2026-10-18";
 
 const ESPN      = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_V2   = "https://site.api.espn.com/apis/v2/sports/football/nfl";
 const ESPN_WEB  = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl";
 const ESPN_CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
+/* Rosters only. ESPN dropped CORS on the whole site.api /teams/* family -- the
+   SAME host still serves /scoreboard with headers intact, so this is a
+   path-level policy and not an outage to wait out. See getRoster. */
+const ESPN_ROSTER = "https://site.web.api.espn.com/apis/site/v2/sports/football/nfl";
 const BYATHLETE = `${ESPN_WEB}/statistics/byathlete`;
 
 /* ---- MODEL CONSTANTS — every one measured, see docs/model.md ----
@@ -532,12 +536,55 @@ function leagueTables(db) {
 
 /* --------------------------- player sources --------------------------- */
 
+/* Which roster groups hold players who could actually take a snap this week.
+   The others are real members of the team -- which is what reconciling an
+   offseason move needs -- but must never be projected, so the group travels
+   with each athlete rather than being thrown away here. */
+const ROSTER_ACTIVE = ["offense", "defense", "specialTeam"];
+
+/**
+ * One team's roster.
+ *
+ * Was `${ESPN}/teams/${id}?enable=roster` until v16. ESPN dropped CORS on the
+ * site.api `/teams/*` family, and because safeJSON turns a CORS rejection into
+ * null, that failure arrived as an EMPTY ROSTER rather than an error. The
+ * matchup view threw "roster unavailable" on every game while the board kept
+ * showing EDGEs, because the scan only uses rosters to reconcile offseason
+ * moves and silently fell back to each player's stale team. A board that still
+ * looks right while a data source is gone is the worst shape this can fail in,
+ * so the scan now counts empty rosters and says so.
+ *
+ * The replacement host is confirmed open; the same site.api host still serves
+ * /scoreboard with CORS headers, so the old breakage was path-level policy.
+ *
+ * Shape differs: athletes arrive as six GROUPS (offense, defense, specialTeam,
+ * injuredReserveOrOut, suspended, practiceSquad), each with `items`, not as one
+ * flat array. The flat form is still handled in case ESPN moves back.
+ */
 async function getRoster(teamId) {
-  const d = await safeJSON(`${ESPN}/teams/${teamId}?enable=roster`);
-  const athletes = d?.team?.athletes || [];   // FLAT array
-  return athletes.map((a) => ({
-    id: a.id, name: a.displayName, jersey: a.jersey, pos: a.position?.abbreviation,
-  })).filter((a) => a.id && a.pos);
+  const d = await safeJSON(`${ESPN_ROSTER}/teams/${teamId}/roster`);
+  const src = d?.athletes;
+  if (!Array.isArray(src)) return [];
+  const take = (a, group) => {
+    const pos = a?.position?.abbreviation;
+    if (!a?.id || !pos) return null;
+    return {
+      id: a.id, name: a.displayName, jersey: a.jersey, pos, group,
+      active: !group || ROSTER_ACTIVE.includes(group),
+    };
+  };
+  const out = [];
+  src.forEach((entry) => {
+    if (Array.isArray(entry?.items)) {
+      const group = entry.position || entry.name || "";
+      entry.items.forEach((a) => { const r = take(a, group); if (r) out.push(r); });
+    } else {
+      /* legacy flat array: no group, so nothing is excluded */
+      const r = take(entry, "");
+      if (r) out.push(r);
+    }
+  });
+  return out;
 }
 
 /**
@@ -1441,6 +1488,15 @@ async function runScan({ year, week, seasonType, league, tables, env, onProgress
   const rosters = await pool(teamIds, 8, (t) => getRoster(t.id));
   const currentTeam = {};
   teamIds.forEach((t, i) => { (rosters[i] || []).forEach((a) => { currentTeam[a.id] = t.abbr; }); });
+  /* Reconciliation is the only thing rosters feed here, and its failure mode is
+     invisible: every player keeps the team the bulk stats pull gave him, which
+     is last season's for anyone who moved. Count it so the board can say so
+     instead of looking healthy. */
+  const rosterHealth = {
+    teams: teamIds.length,
+    empty: rosters.filter((r) => !r || !r.length).length,
+    players: Object.keys(currentTeam).length,
+  };
 
   const byId = new Map();
   pulls.flat().forEach((p) => { if (!byId.has(p.id)) byId.set(p.id, p); });
@@ -1599,7 +1655,7 @@ async function runScan({ year, week, seasonType, league, tables, env, onProgress
   const played = started.filter((g) => g.state === "post" || g.completed).length;
   return {
     rows, games, byes, season: league.season, played, live: started.length - played,
-    starterQB, posMean, dropped,
+    starterQB, posMean, dropped, rosterHealth,
     practice: practice ? { teams: practice.teams, rows: practice.rows } : null,
     statYear: league.season, scanYear: year,
   };
@@ -3057,6 +3113,22 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
       )}
 
       <div style={{ flex: 1, overflowY: "auto", paddingRight: 5 }}>
+        {/* A dead roster feed does NOT empty the board -- reconciliation just
+            stops, every player keeps the team the stats pull gave him, and the
+            EDGEs look exactly as healthy as ever. That is how this hid: the
+            matchup view failed on every game while the home board looked fine.
+            So this warning sits above a WORKING board, not in the empty state. */}
+        {!scanning && scan?.rosterHealth?.empty > 0 && (
+          <Panel style={{ padding: "12px 14px", marginBottom: 8, fontSize: 11.5,
+            lineHeight: 1.6, color: "#f0c9a8", border: `1px solid ${UNDER_C}` }}>
+            <b style={{ color: UNDER_C }}>
+              Rosters unavailable for {scan.rosterHealth.empty} of {scan.rosterHealth.teams} teams.
+            </b>{" "}
+            {scan.rosterHealth.empty === scan.rosterHealth.teams
+              ? "ESPN's roster endpoint is not answering, so matchup pages cannot open and any player who changed teams is still listed with his old one. The EDGEs below are built from season stats and are otherwise unaffected."
+              : "Players who changed teams may still be listed with the old one on those teams."}
+          </Panel>
+        )}
         {scanning && (
           <Panel style={{ padding: "30px 20px", textAlign: "center" }}>
             <div className="pulsing" style={{
@@ -3165,9 +3237,18 @@ function GameView({ game, league, tables, year, week, posMean, env, onBack }) {
     (async () => {
       try {
         const [offRoster, defRoster] = await Promise.all([getRoster(off.id), getRoster(def.id)]);
-        if (!offRoster.length) throw new Error("roster unavailable");
-        const offWant = offRoster.filter((p) => OFF_POS.includes(p.pos));
-        const defWant = defRoster.filter((p) => DEF_POS.includes(p.pos));
+        if (!offRoster.length) {
+          throw new Error(
+            "ESPN's roster endpoint returned nothing for " + off.abbr +
+            ". The Edge Board still works because it runs on season stats, " +
+            "but a matchup page needs the roster to know who is on the field."
+          );
+        }
+        /* p.active drops injuredReserveOrOut / suspended / practiceSquad. Before
+           v16 the flat roster had no groups, so an IR player could be shown with
+           a full projection as though he were playing. */
+        const offWant = offRoster.filter((p) => p.active && OFF_POS.includes(p.pos));
+        const defWant = defRoster.filter((p) => p.active && DEF_POS.includes(p.pos));
         const all = [...offWant, ...defWant];
         const stats = await pool(all, 8, (p) => getAthleteSeason(p.id, league.season));
         if (my !== reqId.current) return;

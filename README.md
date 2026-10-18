@@ -214,7 +214,7 @@ generator, then price it against your book's actual number.
 Open `index.html` in any browser. No build step, no install, no account, no API key.
 Requires an internet connection to pull live ESPN data. Works on phones.
 
-**Check the build stamp.** The header shows a version (e.g. `v15 · 2026-10-14`). If it doesn't
+**Check the build stamp.** The header shows a version (e.g. `v16 · 2026-10-18`). If it doesn't
 match the build you just updated to, you're looking at a cached or older copy — hard-reload
 (⌘⇧R), and if you're on GitHub Pages give it a minute to publish.
 
@@ -244,6 +244,7 @@ falls back automatically, and labels which season each stat came from.
 - [x] ~~Shrink the line an over is graded against~~ — v15: 8 markets, top-quintile over rate 36–40% → 45–55% ([medshrink.md](docs/medshrink.md))
 - [ ] Fix the 5 markets still priced on a raw median — Pass Yds sags +30.7 and Pass+Rush +34.8; their slopes split across seasons, so they need a different treatment, not an averaged constant
 - [ ] Re-shrink QB point estimates — their MAE floor sits at k≈0.30–0.45, 3–5% better than the shipped `SHRINK.QB = 0.90`, a bigger gain than the closing-line work produced ([medshrink.md](docs/medshrink.md))
+- [x] ~~Rosters broken by ESPN's CORS change~~ — v16: `site.api/teams/*` is closed, moved to `site.web.api/teams/{id}/roster`; IR and practice-squad players are now excluded from projection ([api-notes §20](docs/api-notes.md))
 - [ ] Model the kickoff-window / game-script factor
 - [ ] Defense vs archetype (needs a charting data source — PFF, Sports Info Solutions)
 - [ ] True yards allowed by position (requires aggregating opponent box scores)
