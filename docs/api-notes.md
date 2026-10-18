@@ -375,3 +375,77 @@ Measured before building on it:
   row has nothing filed, which is **not** the same as healthy, and nothing in the app may infer
   health from absence.
 - Team codes are nflverse's, so `LA → LAR` and `WAS → WSH` apply here too.
+
+## 20. ESPN closed CORS on `site.api/teams/*` — and it failed silently
+
+**Found 2026-10-18, fixed in v16.** Every matchup page showed "Could not load"
+while the Edge Board kept showing EDGEs as if nothing were wrong.
+
+The roster call was:
+
+```
+https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{id}?enable=roster
+```
+
+From a browser that now fails with `TypeError: Failed to fetch`. It is **not**
+an outage and not the host: measured from a page on espn.com,
+
+| URL | result |
+|---|---|
+| `site.api…/nfl/scoreboard` | **200** |
+| `site.api…/nfl/teams` | Failed to fetch |
+| `site.api…/nfl/teams/34` | Failed to fetch |
+| `site.api…/nfl/teams/34?enable=roster` | Failed to fetch |
+| `site.web.api…/nfl/teams/34/roster` | **200** |
+| `sports.core.api…/teams/34/depthcharts` | **200** |
+
+Same host, one path family open and another closed — so this is path-level
+CORS policy, not something to wait out. `/scoreboard` and the depth-chart call
+on `sports.core.api` are unaffected.
+
+**The replacement** is `site.web.api.espn.com/apis/site/v2/.../teams/{id}/roster`,
+but the shape is different. The old payload was a flat `team.athletes` array.
+The new one is `athletes` as **six groups**, each with `items`:
+
+```
+offense · defense · specialTeam · injuredReserveOrOut · suspended · practiceSquad
+```
+
+Verified across 28 teams: zero missing ids, zero missing
+`position.abbreviation`, correct current-season rosters. Roughly 78–85
+athletes per team, of which 20–27 sit in the three non-active groups.
+
+Keeping the group is the point. The matchup view filters to the active three,
+so an IR or practice-squad player is no longer shown with a full projection —
+the flat array had no way to express that. The scan's offseason-move
+reconciliation uses *all* groups, because a player on IR is still on that team.
+
+### The real lesson: how it hid
+
+`safeJSON` turns any failure into `null`, and `getRoster` ended with
+`d?.team?.athletes || []`. So a dead endpoint returned an **empty roster**
+rather than an error. Downstream:
+
+- the **matchup view** threw `roster unavailable` on every game — visible
+- the **scan** uses rosters *only* to reconcile offseason moves, and fell back
+  to each player's stale team from the bulk stats pull — **invisible**
+
+So the board looked completely healthy while a data source was gone, and the
+only symptom was that every game page broke. The diagnostic panel that would
+have explained it only renders when the board is *empty*, which it never was.
+
+Two changes so this cannot repeat:
+
+1. The scan returns `rosterHealth { teams, empty, players }`, and a warning
+   banner renders **above a working board** whenever `empty > 0`.
+2. The matchup error now names the endpoint and says the board runs on season
+   stats, instead of the bare string `roster unavailable`.
+
+`|| []` on a fetch result is the shape of this bug. An empty result that is
+indistinguishable from a successful one will be read as success.
+
+Tests: `node docs/roster.test.js` — 25 assertions over both payload shapes and
+eight malformed ones, pinning that a dead endpoint yields `[]` without
+throwing or fabricating, *and* that a good payload yields players (a parser
+that always returned `[]` would otherwise pass half of them). Verified against
+the defect: the v15 parser fails 13 of them on the live shape.
