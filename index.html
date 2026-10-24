@@ -109,7 +109,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
  *  - teamrankings.com is NOT CORS-open; a browser page can never fetch it
  * ==================================================================== */
 
-const BUILD = "v16 · 2026-10-18";
+const BUILD = "v17 · 2026-10-24";
 
 const ESPN      = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_V2   = "https://site.api.espn.com/apis/v2/sports/football/nfl";
@@ -1707,9 +1707,10 @@ function snapMarkets(r) {
   return Object.keys(out).length ? out : null;
 }
 
-function saveProjections(year, week, rows, { live = false } = {}) {
-  if (live && store.get(`gx_proj_${year}_${week}`)) return;
-  const snap = rows
+/** The board's rows in snapshot form. Shared by the weekly snapshot and the
+ *  Edge Finder export, so the two can never disagree about a player's numbers. */
+function snapRows(rows) {
+  return rows
     .filter(boardVisible)
     .filter((r) => r.kind !== "DEF" && r.analysis?.headline?.logKey)
     .map((r) => ({
@@ -1730,7 +1731,44 @@ function saveProjections(year, week, rows, { live = false } = {}) {
       markets: snapMarkets(r),
     }))
     .filter((x) => isFinite(x.proj));
+}
+
+function saveProjections(year, week, rows, { live = false } = {}) {
+  if (live && store.get(`gx_proj_${year}_${week}`)) return;
+  const snap = snapRows(rows);
   if (snap.length) store.set(`gx_proj_${year}_${week}`, { year, week, savedAt: Date.now(), band: BAND_VERSION, rows: snap });
+}
+
+/* ===================== EDGE FINDER EXPORT =====================
+ * Edge Finder (a separate tool) prices PrizePicks, Underdog, Fliff and Kalshi
+ * lines against the sharp books. It reads this file to show Gridiron Edge's
+ * read beside each NFL pick as a second opinion. The export is built from the
+ * CURRENT scan, not the stored snapshot: a stored week is frozen once its
+ * first game kicks off, so by Sunday it would carry Thursday's injury news.
+ * ============================================================ */
+function exportPayload(scan, week) {
+  return {
+    source: "gridiron-edge", build: BUILD, exportedAt: new Date().toISOString(),
+    snapshot: { year: scan.scanYear, week, savedAt: Date.now(), band: BAND_VERSION,
+                rows: snapRows(scan.rows || []) },
+  };
+}
+
+/** Download the export. Returns how many players went into it. */
+function exportForEdgeFinder(scan, week) {
+  if (!scan) return 0;
+  const payload = exportPayload(scan, week);
+  const n = payload.snapshot.rows.length;
+  if (!n) return 0;
+  const url = URL.createObjectURL(new Blob([JSON.stringify(payload)], { type: "application/json" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `gridiron-edge-${scan.scanYear}-wk${String(week).padStart(2, "0")}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return n;
 }
 
 /** Per-player actuals for a finished week, from box scores. */
@@ -2948,6 +2986,7 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
   /* market choice is remembered per position, so flipping QB to Pass Att
      doesn't silently change what RB is showing */
   const [market, setMarket] = useState({});
+  const [exported, setExported] = useState("");
   const allRows = scan?.rows || [];
   const active = SCAN_TABS.find((t) => t.key === tab);
   const kind = TAB_KIND[tab];
@@ -3084,6 +3123,15 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
           cursor: scanning ? "default" : "pointer", background: "rgba(0,0,0,.3)",
           color: scanning ? T.inkFaint : T.ink, border: `1px solid ${T.chalkDim}`,
         }}>{scanning ? "Scanning…" : "↻ Rescan"}</button>
+        <button onClick={() => {
+          const n = exportForEdgeFinder(scan, week);
+          setExported(n ? `Exported ${n} players` : "Nothing to export");
+          setTimeout(() => setExported(""), 2500);
+        }} disabled={scanning || !scan} title="Download this week's projections for Edge Finder" style={{
+          padding: "7px 14px", fontSize: 11, fontWeight: 600, borderRadius: 3,
+          cursor: scanning || !scan ? "default" : "pointer", background: "rgba(0,0,0,.3)",
+          color: scanning || !scan ? T.inkFaint : T.ink, border: `1px solid ${T.chalkDim}`,
+        }}>{exported || "⇩ Export for Edge Finder"}</button>
       </div>
 
       {marketDefs.length > 1 && (

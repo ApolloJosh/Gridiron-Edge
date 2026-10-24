@@ -221,6 +221,8 @@ match the build you just updated to, you're looking at a cached or older copy �
 **Rescan** drops every cached API response and re-pulls. Normal navigation reuses responses
 for 5 minutes, so game states refresh on their own without hammering ESPN.
 
+**Export for Edge Finder** downloads `gridiron-edge-<year>-wk<NN>.json` with every player the board shows: per-market median, 25–75 range and EDGE. It is built from the current scan, not the stored weekly snapshot, because a stored week freezes at its first kickoff. Edge Finder turns each range into a probability of clearing the book's line and shows it as a second opinion — the sharp market still decides what gets flagged. Markets still priced on a raw median (Pass Yds, Pass+Rush, Rush+Rec, RB receptions, TE Rec Yds) are labelled as running high there.
+
 ## Design
 
 Field green with white chalk lines, goalpost-yellow accents for projections and highlights,
@@ -251,7 +253,7 @@ falls back automatically, and labels which season each stat came from.
 - [ ] Line movement tracker (reverse line movement, key numbers at 3 / 7 / 10)
 - [x] ~~Project the quiet markets too~~ — v12: per-position market toggle, EDGE recomputed per market
 - [x] ~~Grade the alternate markets on the Over Board~~ — v12
-- [ ] Player prop comparison vs the book's posted line
+- [x] ~~Player prop comparison vs the book's posted line~~ — v17: **Export for Edge Finder** hands the board to the separate Edge Finder tool, which prices PrizePicks / Underdog / Fliff / Kalshi lines against the sharp books and shows this tool's read beside each NFL pick
 - [ ] Depth chart ordering instead of production ordering for early-season slates
 
 ## Stack
