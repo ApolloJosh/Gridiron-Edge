@@ -1467,6 +1467,9 @@ const SCAN_PULLS = [
 ];
 const MIN_VOLUME = { QB: 150, REC: 40, RB: 60, DEF: 30 };
 const MIN_GAMES = 6;
+/* Edge Finder's export also carries players below the board's bar, as long as
+   there are this many games to draw a range from. */
+const EXPORT_MIN_GAMES = 3;
 
 async function runScan({ year, week, seasonType, league, tables, env, onProgress }) {
   onProgress?.("Loading this week's slate…");
@@ -1577,7 +1580,7 @@ async function runScan({ year, week, seasonType, league, tables, env, onProgress
   const crossSeason = league.season !== year;
 
   onProgress?.(`Scoring ${players.length} players…`);
-  const rows = [];
+  const rows = [], extra = [];
   const dropped = { noScore: 0, fewGames: 0, lowVolume: 0, maxGames: 0, considered: 0 };
   for (const p of players) {
     const kind = KIND_OF_POS(p.pos);
@@ -1603,14 +1606,7 @@ async function runScan({ year, week, seasonType, league, tables, env, onProgress
       posMean, crossSeason, env, statSeason: league.season,
     };
     const a = analyze(p, kind, ctx);
-    if (a.score === null) { dropped.noScore++; continue; }
-    if (!(a.gamesPlayed >= MIN_GAMES)) {
-      dropped.fewGames++;
-      dropped.maxGames = Math.max(dropped.maxGames, a.gamesPlayed || 0);
-      continue;
-    }
-    if (!(a.volume >= (MIN_VOLUME[kind] || 0))) { dropped.lowVolume++; continue; }
-    rows.push({
+    const row = () => ({
       player: p, kind, pos: p.pos, team: p.team, opp: meta.opp, home: meta.home,
       moved: p.moved, game: meta.game, ctx, analysis: a, score: a.score,
       depth: depthOf[p.id] || null,
@@ -1619,6 +1615,22 @@ async function runScan({ year, week, seasonType, league, tables, env, onProgress
       state: meta.game.state || "pre", started: hasStarted(meta.game),
       leakage: league.season === year && hasStarted(meta.game),
     });
+    if (a.score === null) { dropped.noScore++; continue; }
+    /* Too few games or too little volume to rank on the board, but the books
+       still post lines on these players, so Edge Finder's export keeps them
+       (extra). They never reach the board, the snapshot or the Report Card. */
+    if (!(a.gamesPlayed >= MIN_GAMES)) {
+      dropped.fewGames++;
+      dropped.maxGames = Math.max(dropped.maxGames, a.gamesPlayed || 0);
+      if (a.gamesPlayed >= EXPORT_MIN_GAMES) extra.push(row());
+      continue;
+    }
+    if (!(a.volume >= (MIN_VOLUME[kind] || 0))) {
+      dropped.lowVolume++;
+      if (a.gamesPlayed >= EXPORT_MIN_GAMES) extra.push(row());
+      continue;
+    }
+    rows.push(row());
   }
   rows.sort((a, b) => b.score - a.score);
   /* An empty board should say which threshold emptied it, rather than leaving
@@ -1654,7 +1666,7 @@ async function runScan({ year, week, seasonType, league, tables, env, onProgress
   const started = games.filter(hasStarted);
   const played = started.filter((g) => g.state === "post" || g.completed).length;
   return {
-    rows, games, byes, season: league.season, played, live: started.length - played,
+    rows, extra, games, byes, season: league.season, played, live: started.length - played,
     starterQB, posMean, dropped, rosterHealth,
     practice: practice ? { teams: practice.teams, rows: practice.rows } : null,
     statYear: league.season, scanYear: year,
@@ -1749,10 +1761,10 @@ function saveProjections(year, week, rows, { live = false } = {}) {
 /* The scan pulls game logs only for the top 20 at each position, to keep it
    quick, and a player needs his log for a median and range. Edge Finder
    wants a read on every line it prices, so before exporting, the rest of the
-   visible board gets its logs and is analyzed the same way the matchup view
+   visible board and the players below the board's bar (scan.extra) get logs and is analyzed the same way the matchup view
    does it. Copies, so the board on screen doesn't change under you. */
 async function withAllLogs(scan, onProgress) {
-  const rows = scan.rows || [];
+  const rows = (scan.rows || []).concat(scan.extra || []);
   const need = rows.filter((r) => r.kind !== "DEF" && boardVisible(r) && !r.ctx?.log);
   if (!need.length) return rows;
   onProgress?.(need.length);
