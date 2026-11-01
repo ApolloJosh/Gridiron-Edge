@@ -109,7 +109,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
  *  - teamrankings.com is NOT CORS-open; a browser page can never fetch it
  * ==================================================================== */
 
-const BUILD = "v17 · 2026-10-24";
+const BUILD = "v18 · 2026-11-01";
 
 const ESPN      = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_V2   = "https://site.api.espn.com/apis/v2/sports/football/nfl";
@@ -1746,18 +1746,41 @@ function saveProjections(year, week, rows, { live = false } = {}) {
  * CURRENT scan, not the stored snapshot: a stored week is frozen once its
  * first game kicks off, so by Sunday it would carry Thursday's injury news.
  * ============================================================ */
-function exportPayload(scan, week) {
+/* The scan pulls game logs only for the top 20 at each position, to keep it
+   quick, and a player needs his log for a median and range. Edge Finder
+   wants a read on every line it prices, so before exporting, the rest of the
+   visible board gets its logs and is analyzed the same way the matchup view
+   does it. Copies, so the board on screen doesn't change under you. */
+async function withAllLogs(scan, onProgress) {
+  const rows = scan.rows || [];
+  const need = rows.filter((r) => r.kind !== "DEF" && boardVisible(r) && !r.ctx?.log);
+  if (!need.length) return rows;
+  onProgress?.(need.length);
+  const season = scan.statYear || scan.season;
+  const logs = await pool(need, 8, (r) => getGameLog(r.player.id, season).catch(() => null));
+  const done = new Map();
+  need.forEach((r, i) => {
+    if (!logs[i]) return;
+    const ctx = { ...r.ctx, log: logs[i], oppHistory: logs[i].filter((g) => g.opp === r.opp) };
+    const analysis = analyze(r.player, r.kind, ctx);
+    done.set(r, { ...r, ctx, analysis, score: analysis.score });
+  });
+  return rows.map((r) => done.get(r) || r);
+}
+
+async function exportPayload(scan, week, onProgress) {
+  const rows = await withAllLogs(scan, onProgress);
   return {
     source: "gridiron-edge", build: BUILD, exportedAt: new Date().toISOString(),
     snapshot: { year: scan.scanYear, week, savedAt: Date.now(), band: BAND_VERSION,
-                rows: snapRows(scan.rows || []) },
+                rows: snapRows(rows) },
   };
 }
 
 /** Download the export. Returns how many players went into it. */
-function exportForEdgeFinder(scan, week) {
+async function exportForEdgeFinder(scan, week, onProgress) {
   if (!scan) return 0;
-  const payload = exportPayload(scan, week);
+  const payload = await exportPayload(scan, week, onProgress);
   const n = payload.snapshot.rows.length;
   if (!n) return 0;
   const url = URL.createObjectURL(new Blob([JSON.stringify(payload)], { type: "application/json" }));
@@ -3123,11 +3146,15 @@ function Scanner({ scan, scanning, progress, league, week, onOpen, onRescan }) {
           cursor: scanning ? "default" : "pointer", background: "rgba(0,0,0,.3)",
           color: scanning ? T.inkFaint : T.ink, border: `1px solid ${T.chalkDim}`,
         }}>{scanning ? "Scanning…" : "↻ Rescan"}</button>
-        <button onClick={() => {
-          const n = exportForEdgeFinder(scan, week);
+        <button onClick={async () => {
+          setExported("Exporting…");
+          let n = 0;
+          try {
+            n = await exportForEdgeFinder(scan, week, (k) => setExported(`Pulling ${k} more game logs…`));
+          } catch (e) { console.error(e); }
           setExported(n ? `Exported ${n} players` : "Nothing to export");
           setTimeout(() => setExported(""), 2500);
-        }} disabled={scanning || !scan} title="Download this week's projections for Edge Finder" style={{
+        }} disabled={scanning || !scan || !!exported} title="Download this week's projections for Edge Finder" style={{
           padding: "7px 14px", fontSize: 11, fontWeight: 600, borderRadius: 3,
           cursor: scanning || !scan ? "default" : "pointer", background: "rgba(0,0,0,.3)",
           color: scanning || !scan ? T.inkFaint : T.ink, border: `1px solid ${T.chalkDim}`,
